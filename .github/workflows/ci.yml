@@ -26,21 +26,24 @@ jobs:
           bundler-cache: false
           working-directory: app
 
-      - name: Install Rails codegen bundle
+      - name: Install Rails-free TruffleRuby bundle
         working-directory: app
         env:
-          BUNDLE_PATH: vendor/bundle-codegen
-        run: bundle install --jobs 4 --retry 3
+          BUNDLE_PATH: vendor/bundle-runtime
+          BUNDLE_WITHOUT: rails:test
+        run: |
+          bundle install --jobs 4 --retry 3
+          truffleruby -e 'abort "Rails gem leaked into worker bundle" unless Gem::Specification.find_all_by_name("rails").empty?; abort "Rails constant loaded" if defined?(Rails)'
 
-      - name: Generate co-located handlers from Rails conventions
+      - name: Generate co-located handlers without Rails
         working-directory: app
         env:
-          BUNDLE_PATH: vendor/bundle-codegen
-          RAILS_ENV: test
+          BUNDLE_PATH: vendor/bundle-runtime
+          BUNDLE_WITHOUT: rails:test
           ORES_BUILD_TARGET: lambda
           ORES_LAMBDA_HANDLER_GRANULARITY: route
         run: |
-          bundle exec ruby bin/build-runtime
+          truffleruby bin/build-runtime
           test -f generated/lambda/entrypoint.rb
           test -f generated/lambda/routes.rb
           test -f app/controllers/users/show/endpoint_controller.rb
@@ -49,23 +52,13 @@ jobs:
           test -f app/controllers/orders/cancel/handler.rb
           test ! -d routes
           git check-ignore -q app/controllers/users/show/handler.rb
-          grep -Fq '"route_source": "Rails.application.routes"' generated/lambda/manifest.json
+          grep -Fq '"route_source": "config/routes.rb:static-ripper"' generated/lambda/manifest.json
           grep -Fq '"controller": "users/show/endpoint"' generated/lambda/manifest.json
           grep -Fq '"action": "show"' generated/lambda/manifest.json
           grep -Fq '"handler_constant": "Users::Show::Handler"' generated/lambda/manifest.json
           grep -Fq 'module Handler' app/controllers/users/show/handler.rb
-          BUNDLE_PATH=vendor/bundle-codegen bundle exec rails runner 'Rails.application.eager_load!; abort "generated handler not Zeitwerk-loadable" unless defined?(Users::Show::Handler)'
-          ! find generated/lambda -name '*.rb' -print0 | xargs -0 grep -E 'config/environment|Rails\.application'
-          ! find app/controllers -name handler.rb -print0 | xargs -0 grep -E 'config/environment|Rails\.application'
-
-      - name: Install and prove Rails-free worker bundle
-        working-directory: app
-        env:
-          BUNDLE_PATH: vendor/bundle-runtime
-          BUNDLE_WITHOUT: rails:test
-        run: |
-          bundle install --jobs 4 --retry 3
-          bundle exec ruby -e 'abort "Rails gem leaked into worker bundle" unless Gem::Specification.find_all_by_name("rails").empty?; abort "Rails constant loaded" if defined?(Rails)'
+          ! find generated/lambda -name '*.rb' -print0 | xargs -0 grep -E 'config/environment|Rails\.application|defined\?\(Rails\)'
+          ! find app/controllers -name handler.rb -print0 | xargs -0 grep -E 'config/environment|Rails\.application|defined\?\(Rails\)'
 
       - uses: actions/setup-java@v4
         with:
