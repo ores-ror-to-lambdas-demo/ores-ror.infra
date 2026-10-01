@@ -15,7 +15,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: ores-ror-to-lambdas-demo/ores-ror.rb
-          ref: feat/filesystem-route-handlers
+          ref: feat/colocated-rails-endpoint-handlers
           path: app
       - uses: ruby/setup-ruby@v1
         with:
@@ -30,7 +30,7 @@ jobs:
         run: |
           bundle install --jobs 4 --retry 3
           ruby -e 'abort "Rails gem leaked into Graal worker bundle" unless Gem::Specification.find_all_by_name("rails").empty?'
-      - name: Build URL-shaped lambda handlers for Graal workers
+      - name: Generate co-located endpoint handlers for Graal workers
         working-directory: app
         env:
           BUNDLE_PATH: vendor/bundle-truffleruby
@@ -40,11 +40,14 @@ jobs:
         run: |
           bundle exec ruby bin/build-runtime
           test -f generated/lambda/entrypoint.rb
-          test -f 'generated/lambda/routes/users/[id]/handler.rb'
-          test -f 'generated/lambda/routes/orders/[id]/cancel/handler.rb'
-          test -f 'routes/users/[id]/handler.rb'
-          test -f 'routes/orders/[id]/cancel/handler.rb'
-          ! grep -R -E 'config/environment|Rails\.application' generated/lambda routes graal/bootstrap.rb
+          test -f app/controllers/users/show/endpoint_controller.rb
+          test -f app/controllers/users/show/handler.rb
+          test -f app/controllers/orders/cancel/endpoint_controller.rb
+          test -f app/controllers/orders/cancel/handler.rb
+          git -C . check-ignore -q app/controllers/users/show/handler.rb
+          test ! -d routes
+          ! grep -R -E 'config/environment|Rails\.application' generated/lambda graal/bootstrap.rb
+          ! find app/controllers -name handler.rb -print0 | xargs -0 grep -E 'config/environment|Rails\.application'
       - uses: actions/setup-java@v4
         with:
           distribution: graalvm
