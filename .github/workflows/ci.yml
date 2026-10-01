@@ -1,0 +1,52 @@
+name: infra-ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  embedded-rails-cluster:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: infra }
+      - uses: actions/checkout@v4
+        with:
+          repository: ores-ror-to-lambdas-demo/ores-ror.rb
+          path: app
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: truffleruby+graalvm-25.0.0
+          bundler-cache: false
+          working-directory: app
+      - name: Install the one Rails dependency tree for embedded TruffleRuby
+        working-directory: app
+        run: |
+          bundle config set path vendor/bundle
+          bundle install --jobs 4 --retry 3
+      - uses: actions/setup-java@v4
+        with:
+          distribution: graalvm
+          java-version: '21'
+          cache: maven
+      - name: Build supervisor and run 2-cell / 6-worker concurrency smoke
+        run: mvn -f infra/pom.xml -Dapp.root="$GITHUB_WORKSPACE/app" test
+      - name: Package runnable supervisor
+        run: mvn -f infra/pom.xml -DskipTests package
+
+  ruby-native-isolate-upstream-capability:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: graalvm
+          java-version: '25'
+      - name: Prove Ruby native-isolate artifact is not published yet
+        run: |
+          if mvn -q dependency:get -Dartifact=org.graalvm.polyglot:ruby-isolate-linux-amd64-community:25.1.3:pom; then
+            echo 'Ruby native isolate artifact now exists; remove this blocker test and enable spawnIsolate(true).'
+            exit 1
+          fi
+          echo 'Expected upstream gap confirmed: Ruby is not yet a published polyglot native-isolate language.'

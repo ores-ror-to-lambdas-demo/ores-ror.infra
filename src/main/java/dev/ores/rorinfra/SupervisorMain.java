@@ -6,22 +6,24 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.InetSocketAddress;
 import java.net.URI;
-import java.net.URLDecoder;
+import java.net.URLEncoder;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
@@ -37,685 +39,207 @@ import org.graalvm.polyglot.Engine;
 import org.graalvm.polyglot.EnvironmentAccess;
 import org.graalvm.polyglot.HostAccess;
 import org.graalvm.polyglot.PolyglotAccess;
-import org.graalvm.polyglot.SandboxPolicy;
 import org.graalvm.polyglot.Source;
 import org.graalvm.polyglot.Value;
 import org.graalvm.polyglot.io.IOAccess;
+import org.graalvm.polyglot.proxy.ProxyExecutable;
 
 public final class SupervisorMain {
-    private static final ObjectMapper JSON = new ObjectMapper();
-    private static final int MAX_BODY_BYTES = 1024 * 1024;
+  static final ObjectMapper JSON = new ObjectMapper();
+  static final int MAX_BODY = 1024 * 1024;
 
-    private SupervisorMain() {}
+  private SupervisorMain() {}
 
-    public static void main(String[] args) throws Exception {
-        final Settings settings = Settings.fromEnv();
-        final Source source = Source.newBuilder(
-            "ruby",
-            Files.readString(settings.handlerPath, StandardCharsets.UTF_8),
-            settings.handlerPath.getFileName().toString()
-        ).cached(true).build();
-        final Router router = Router.load(settings.routeContractPath);
-        final HttpSupport httpSupport = new HttpSupport(settings.dataApiUrl, settings.dataApiToken);
-        final IsolateSupervisor supervisor = new IsolateSupervisor(settings, source, httpSupport);
-        final ExecutorService ingressPool = Executors.newFixedThreadPool(
-            Math.max(2, settings.maxIsolates * settings.maxConcurrency),
-            namedThreads("ror-ingress")
-        );
+  public static void main(String[] args) throws Exception {
+    Settings s = Settings.fromEnv();
+    try (Cluster cluster = new Cluster(s)) {
+      ExecutorService ingress = Executors.newFixedThreadPool(
+        Math.max(4, s.maxCells * s.workersPerCell), named("ingress"));
+      HttpServer server = HttpServer.create(new InetSocketAddress(s.bindHost, s.port), 128);
+      server.setExecutor(ingress);
+      server.createContext("/", ex -> handle(ex, cluster));
+      Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+        server.stop(1); ingress.shutdown(); cluster.close();
+      }, "ror-shutdown"));
+      server.start();
+      System.out.printf("Rails/Graal cluster listening on http://%s:%d cells=%d workers/cell=%d%n",
+        s.bindHost, s.port, s.minCells, s.workersPerCell);
+      Thread.currentThread().join();
+    }
+  }
 
-        final HttpServer server = HttpServer.create(
-            new InetSocketAddress(settings.bindHost, settings.port),
-            128
-        );
-        server.setExecutor(ingressPool);
-        server.createContext("/", exchange -> handle(exchange, router, supervisor, settings));
+  static void handle(HttpExchange ex, Cluster cluster) throws IOException {
+    try {
+      byte[] input = ex.getRequestBody().readNBytes(MAX_BODY + 1);
+      if (input.length > MAX_BODY) { sendError(ex, 413, "request body too large"); return; }
+      ObjectNode req = JSON.createObjectNode();
+      req.put("request_id", requestId(ex.getRequestHeaders().getFirst("x-request-id")));
+      req.put("method", ex.getRequestMethod());
+      req.put("path", ex.getRequestURI().getPath());
+      req.put("query_string", ex.getRequestURI().getRawQuery() == null ? "" : ex.getRequestURI().getRawQuery());
+      req.put("body", new String(input, StandardCharsets.UTF_8));
+      req.put("content_type", valueOr(ex.getRequestHeaders().getFirst("content-type"), "application/json"));
+      JsonNode result = cluster.invoke(req);
+      int status = result.path("status").asInt(500);
+      result.path("headers").fields().forEachRemaining(h -> {
+        if (h.getValue().isTextual() && !h.getKey().equalsIgnoreCase("content-length")
+            && !h.getKey().equalsIgnoreCase("connection")) {
+          ex.getResponseHeaders().set(h.getKey(), h.getValue().asText());
+        }
+      });
+      byte[] body = result.path("body").asText("").getBytes(StandardCharsets.UTF_8);
+      ex.sendResponseHeaders(status, body.length);
+      ex.getResponseBody().write(body);
+    } catch (RejectedExecutionException e) {
+      sendError(ex, 503, "Graal workers saturated");
+    } catch (TimeoutException e) {
+      sendError(ex, 504, "Graal request timed out");
+    } catch (Exception e) {
+      sendError(ex, 500, safe(e));
+    } finally { ex.close(); }
+  }
 
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            server.stop(1);
-            ingressPool.shutdown();
-            supervisor.close();
-        }, "ror-shutdown"));
+  static void sendError(HttpExchange ex, int status, String message) throws IOException {
+    byte[] b = JSON.writeValueAsBytes(JSON.createObjectNode().put("error", message));
+    ex.getResponseHeaders().set("content-type", "application/json; charset=utf-8");
+    ex.sendResponseHeaders(status, b.length); ex.getResponseBody().write(b);
+  }
 
-        server.start();
-        System.out.println("ores-ror supervisor listening on http://" + settings.bindHost + ":" + settings.port);
+  static final class Settings {
+    final String bindHost; final int port; final Path appRoot; final Path bootstrap;
+    final String railsEnv; final String dataUrl; final String dataToken;
+    final int minCells; final int maxCells; final int workersPerCell;
+    final long maxAgeMs; final long idleMs; final long drainMs;
+
+    Settings(String bindHost, int port, Path appRoot, String railsEnv, String dataUrl,
+             String dataToken, int minCells, int maxCells, int workersPerCell,
+             long maxAgeMs, long idleMs, long drainMs) {
+      this.bindHost=bindHost; this.port=port; this.appRoot=appRoot;
+      this.bootstrap=appRoot.resolve("graal/bootstrap.rb").normalize(); this.railsEnv=railsEnv;
+      this.dataUrl=dataUrl; this.dataToken=dataToken; this.minCells=minCells; this.maxCells=maxCells;
+      this.workersPerCell=workersPerCell; this.maxAgeMs=maxAgeMs; this.idleMs=idleMs; this.drainMs=drainMs;
+      validate();
     }
 
-    private static void handle(
-        HttpExchange exchange,
-        Router router,
-        IsolateSupervisor supervisor,
-        Settings settings
-    ) throws IOException {
-        try {
-            final RouteMatch match = router.match(
-                exchange.getRequestMethod(),
-                exchange.getRequestURI().getPath()
-            );
-            if (match == null) {
-                send(exchange, 404, JSON.createObjectNode().put("error", "route not found"));
-                return;
-            }
-
-            final byte[] bodyBytes = exchange.getRequestBody().readNBytes(MAX_BODY_BYTES + 1);
-            if (bodyBytes.length > MAX_BODY_BYTES) {
-                send(exchange, 413, JSON.createObjectNode().put("error", "request body too large"));
-                return;
-            }
-
-            final String requestId = safeRequestId(exchange.getRequestHeaders().getFirst("x-request-id"));
-            exchange.getResponseHeaders().set("x-request-id", requestId);
-            final ObjectNode envelope = JSON.createObjectNode();
-            envelope.put("request_id", requestId);
-            envelope.put("route", match.name);
-            envelope.put("method", exchange.getRequestMethod());
-            envelope.put("data_api_base_url", settings.dataApiUrl);
-            final ObjectNode params = envelope.putObject("params");
-            match.params.forEach(params::put);
-            final ObjectNode query = envelope.putObject("query");
-            parseQuery(exchange.getRequestURI().getRawQuery()).forEach(query::put);
-
-            if (bodyBytes.length > 0) {
-                try {
-                    final JsonNode body = JSON.readTree(bodyBytes);
-                    envelope.set("body", body == null ? JSON.nullNode() : body);
-                } catch (IOException malformedJson) {
-                    throw new IllegalArgumentException("request body must be valid JSON");
-                }
-            }
-
-            final JsonNode result = supervisor.invoke(envelope);
-            final int status = result.path("status").asInt(result.path("ok").asBoolean(false) ? 200 : 500);
-            if (result.path("body").isMissingNode()) {
-                send(exchange, status, result);
-            } else {
-                send(exchange, status, result.path("body"));
-            }
-        } catch (RejectedExecutionException error) {
-            send(exchange, 503, JSON.createObjectNode().put("error", "all isolates are saturated"));
-        } catch (TimeoutException error) {
-            send(exchange, 504, JSON.createObjectNode().put("error", "isolate execution timed out"));
-        } catch (IllegalArgumentException error) {
-            send(exchange, 400, JSON.createObjectNode().put("error", error.getMessage()));
-        } catch (Exception error) {
-            send(exchange, 500, JSON.createObjectNode().put("error", safeMessage(error)));
-        } finally {
-            exchange.close();
-        }
+    static Settings fromEnv() {
+      int min = integer("MIN_ISOLATES", 1, 1, 32);
+      return new Settings(env("BIND_HOST","127.0.0.1"), integer("PORT",8080,1,65535),
+        Path.of(env("APP_ROOT","../ores-ror.rb")).toAbsolutePath().normalize(), env("RAILS_ENV","production"),
+        env("DATA_API_URL","http://127.0.0.1:8787/v1"), env("DATA_API_TOKEN",""), min,
+        integer("MAX_ISOLATES",4,min,64), integer("ISOLATE_MAX_CONCURRENCY",5,1,5),
+        1000L*integer("ISOLATE_MAX_AGE_SECONDS",1800,60,1800),
+        1000L*integer("ISOLATE_IDLE_SECONDS",300,30,300),
+        1000L*integer("ISOLATE_DRAIN_SECONDS",30,1,300));
     }
 
-    private static String safeRequestId(String candidate) {
-        if (candidate != null && candidate.matches("[A-Za-z0-9._:-]{1,128}")) {
-            return candidate;
-        }
-        return "ores-request-" + UUID.randomUUID();
+    static Settings test(Path root, int cells, int workers) {
+      return new Settings("127.0.0.1",0,root.toAbsolutePath().normalize(),"test",
+        "http://127.0.0.1:9/v1","",cells,cells,workers,1_800_000,300_000,5_000);
     }
 
-    private static Map<String, String> parseQuery(String rawQuery) {
-        final Map<String, String> result = new HashMap<>();
-        if (rawQuery == null || rawQuery.isBlank()) {
-            return result;
-        }
-        for (String pair : rawQuery.split("&")) {
-            final String[] parts = pair.split("=", 2);
-            final String key = URLDecoder.decode(parts[0], StandardCharsets.UTF_8);
-            final String value = parts.length == 2
-                ? URLDecoder.decode(parts[1], StandardCharsets.UTF_8)
-                : "";
-            if (result.size() >= 64) {
-                throw new IllegalArgumentException("too many query parameters");
-            }
-            result.put(key, value);
-        }
-        return result;
+    void validate() {
+      if (!Files.isRegularFile(appRoot.resolve("config/environment.rb")))
+        throw new IllegalArgumentException("APP_ROOT is not a Rails app: "+appRoot);
+      if (!Files.isRegularFile(bootstrap))
+        throw new IllegalArgumentException("missing graal/bootstrap.rb: "+bootstrap);
+      URI u=URI.create(dataUrl); if (!List.of("http","https").contains(u.getScheme()))
+        throw new IllegalArgumentException("DATA_API_URL must use http or https");
     }
 
-    private static void send(HttpExchange exchange, int status, JsonNode body) throws IOException {
-        final byte[] bytes = JSON.writeValueAsBytes(body);
-        exchange.getResponseHeaders().set("content-type", "application/json; charset=utf-8");
-        exchange.getResponseHeaders().set("x-content-type-options", "nosniff");
-        exchange.sendResponseHeaders(status, bytes.length);
-        exchange.getResponseBody().write(bytes);
+    static int integer(String n,int d,int min,int max) {
+      int v=Integer.parseInt(env(n,Integer.toString(d)));
+      if(v<min||v>max) throw new IllegalArgumentException(n+" must be between "+min+" and "+max); return v;
+    }
+    static String env(String n,String d) { String v=System.getenv(n); return v==null||v.isBlank()?d:v; }
+  }
+
+  static final class Cluster implements AutoCloseable {
+    final Settings s; final HttpBridge http; final List<Cell> cells=new ArrayList<>();
+    final ScheduledExecutorService maintenance=Executors.newSingleThreadScheduledExecutor(named("maintenance"));
+    long nextId; boolean closed;
+
+    Cluster(Settings s) throws Exception {
+      this.s=s; this.http=new HttpBridge(s.dataUrl,s.dataToken);
+      synchronized(this){ ensureMin(); }
+      maintenance.scheduleAtFixedRate(this::maintainSafe,1,1,TimeUnit.SECONDS);
     }
 
-    private static ThreadFactory namedThreads(String prefix) {
-        final AtomicInteger counter = new AtomicInteger();
-        return runnable -> {
-            final Thread thread = new Thread(runnable, prefix + "-" + counter.incrementAndGet());
-            thread.setDaemon(false);
-            return thread;
-        };
+    JsonNode invoke(ObjectNode req) throws Exception {
+      Cell cell; synchronized(this){ maintain(System.currentTimeMillis()); cell=select(); }
+      return cell.submit(req).get(15,TimeUnit.SECONDS);
     }
 
-    private static String safeMessage(Throwable error) {
-        final Throwable root = error instanceof ExecutionException && error.getCause() != null
-            ? error.getCause() : error;
-        final String message = root.getMessage();
-        final String value = message == null || message.isBlank()
-            ? root.getClass().getSimpleName() : message;
-        return value.length() <= 512 ? value : value.substring(0, 512);
+    synchronized int cellCount(){ return cells.size(); }
+    synchronized int workerCount(){ return cells.stream().mapToInt(c->c.s.workersPerCell).sum(); }
+
+    Cell select() throws Exception {
+      List<Cell> open=cells.stream().filter(Cell::accepting).sorted(Comparator.comparingInt(Cell::load)).toList();
+      if(open.isEmpty()){ Cell c=create(); cells.add(c); return c; }
+      Cell c=open.get(0);
+      if(c.load()>=s.workersPerCell && open.size()<s.maxCells){ Cell n=create(); cells.add(n); return n; }
+      return c;
     }
 
-    static final class Settings {
-        final String bindHost;
-        final int port;
-        final Path handlerPath;
-        final Path routeContractPath;
-        final String dataApiUrl;
-        final String dataApiToken;
-        final int minIsolates;
-        final int maxIsolates;
-        final int maxConcurrency;
-        final long maxAgeMillis;
-        final long idleMillis;
-        final long drainMillis;
+    void maintainSafe(){ try{ synchronized(this){ if(!closed) maintain(System.currentTimeMillis()); } }catch(Throwable e){System.err.println(safe(e));} }
+    void maintain(long now) throws Exception {
+      int idleBudget=Math.max(0,(int)cells.stream().filter(Cell::accepting).count()-s.minCells);
+      for(Cell c:cells){ if(!c.accepting()) continue; if(c.old(now)) c.retire(); else if(idleBudget>0&&c.idle(now)){c.retire();idleBudget--;} }
+      ensureMin();
+      List<Cell> gone=new ArrayList<>(); for(Cell c:cells){if(c.retiring()&&c.load()==0){c.close();gone.add(c);}} cells.removeAll(gone); ensureMin();
+    }
+    void ensureMin() throws Exception { while(!closed&&cells.stream().filter(Cell::accepting).count()<s.minCells) cells.add(create()); }
+    Cell create() throws Exception { return new Cell("cell-"+(++nextId),s,http); }
+    public synchronized void close(){ if(closed)return; closed=true; maintenance.shutdownNow(); for(Cell c:cells)c.closeAfterDrain(); cells.clear(); }
+  }
 
-        private Settings(
-            String bindHost,
-            int port,
-            Path handlerPath,
-            Path routeContractPath,
-            String dataApiUrl,
-            String dataApiToken,
-            int minIsolates,
-            int maxIsolates,
-            int maxConcurrency,
-            long maxAgeMillis,
-            long idleMillis,
-            long drainMillis
-        ) {
-            this.bindHost = bindHost;
-            this.port = port;
-            this.handlerPath = handlerPath;
-            this.routeContractPath = routeContractPath;
-            this.dataApiUrl = dataApiUrl;
-            this.dataApiToken = dataApiToken;
-            this.minIsolates = minIsolates;
-            this.maxIsolates = maxIsolates;
-            this.maxConcurrency = maxConcurrency;
-            this.maxAgeMillis = maxAgeMillis;
-            this.idleMillis = idleMillis;
-            this.drainMillis = drainMillis;
-        }
+  static final class Cell implements AutoCloseable {
+    final String id; final Settings s; final Engine engine; final BlockingQueue<RailsWorker> workers;
+    final ThreadPoolExecutor pool; final long born=System.currentTimeMillis(); final AtomicLong last=new AtomicLong(born);
+    final AtomicInteger active=new AtomicInteger(); volatile boolean open=true; volatile boolean closed;
 
-        static Settings fromEnv() {
-            final int concurrency = boundedInt("ISOLATE_MAX_CONCURRENCY", 5, 1, 5);
-            final int min = boundedInt("MIN_ISOLATES", 1, 1, 32);
-            final int max = boundedInt("MAX_ISOLATES", 4, min, 64);
-            final String dataApiUrl = requiredEnv("DATA_API_URL").replaceAll("/$", "");
-            final URI dataUri = URI.create(dataApiUrl);
-            if (!List.of("http", "https").contains(dataUri.getScheme())) {
-                throw new IllegalArgumentException("DATA_API_URL must use http or https");
-            }
-            return new Settings(
-                env("BIND_HOST", "127.0.0.1"),
-                boundedInt("PORT", 8080, 1, 65535),
-                Path.of(env("HANDLER_PATH", "../ores-ror.rb/graal/handler.rb")).toAbsolutePath().normalize(),
-                Path.of(env("ROUTE_CONTRACT_PATH", "../ores-ror.rb/graal/routes.json")).toAbsolutePath().normalize(),
-                dataApiUrl,
-                env("DATA_API_TOKEN", ""),
-                min,
-                max,
-                concurrency,
-                TimeUnit.SECONDS.toMillis(boundedInt("ISOLATE_MAX_AGE_SECONDS", 1800, 60, 1800)),
-                TimeUnit.SECONDS.toMillis(boundedInt("ISOLATE_IDLE_SECONDS", 300, 30, 300)),
-                TimeUnit.SECONDS.toMillis(boundedInt("ISOLATE_DRAIN_SECONDS", 30, 1, 300))
-            );
-        }
-
-        private static int boundedInt(String name, int fallback, int min, int max) {
-            final int value = Integer.parseInt(env(name, Integer.toString(fallback)));
-            if (value < min || value > max) {
-                throw new IllegalArgumentException(name + " must be between " + min + " and " + max);
-            }
-            return value;
-        }
-
-        private static String requiredEnv(String name) {
-            final String value = System.getenv(name);
-            if (value == null || value.isBlank()) {
-                throw new IllegalStateException("missing required environment variable " + name);
-            }
-            return value;
-        }
-
-        private static String env(String name, String fallback) {
-            final String value = System.getenv(name);
-            return value == null || value.isBlank() ? fallback : value;
-        }
+    Cell(String id,Settings s,HttpBridge http) throws Exception {
+      this.id=id; this.s=s; this.engine=Engine.newBuilder("ruby").build(); this.workers=new ArrayBlockingQueue<>(s.workersPerCell);
+      try{ for(int i=0;i<s.workersPerCell;i++) workers.add(new RailsWorker(engine,s,http)); }
+      catch(Exception e){workers.forEach(RailsWorker::close);engine.close();throw e;}
+      this.pool=new ThreadPoolExecutor(s.workersPerCell,s.workersPerCell,0,TimeUnit.MILLISECONDS,
+        new ArrayBlockingQueue<>(s.workersPerCell*8),named(id),new ThreadPoolExecutor.AbortPolicy());
     }
 
-    static final class IsolateSupervisor implements AutoCloseable {
-        private final Settings settings;
-        private final Source source;
-        private final HttpSupport support;
-        private final List<RubyIsolate> isolates = new ArrayList<>();
-        private final ScheduledExecutorService maintenance = Executors.newSingleThreadScheduledExecutor(
-            namedThreads("ror-maintenance")
-        );
-        private long nextId;
-        private boolean closed;
+    CompletableFuture<JsonNode> submit(ObjectNode req){ if(!accepting())throw new RejectedExecutionException("cell retiring"); last.set(System.currentTimeMillis());
+      CompletableFuture<JsonNode> f=new CompletableFuture<>(); pool.execute(()->{RailsWorker w=null;active.incrementAndGet();try{w=workers.take();f.complete(w.invoke(req));}catch(Throwable e){f.completeExceptionally(e);}finally{if(w!=null&&!closed)workers.offer(w);active.decrementAndGet();last.set(System.currentTimeMillis());}});return f; }
+    int load(){return active.get()+pool.getQueue().size();} boolean accepting(){return open&&!closed;} boolean retiring(){return !open&&!closed;}
+    boolean old(long n){return n-born>=s.maxAgeMs;} boolean idle(long n){return load()==0&&n-last.get()>=s.idleMs;} void retire(){open=false;pool.shutdown();}
+    void closeAfterDrain(){open=false;pool.shutdown();try{if(!pool.awaitTermination(s.drainMs,TimeUnit.MILLISECONDS))pool.shutdownNow();}catch(InterruptedException e){Thread.currentThread().interrupt();pool.shutdownNow();}closeResources();}
+    public void close(){open=false;pool.shutdown();if(load()!=0)throw new IllegalStateException("cell busy");closeResources();}
+    synchronized void closeResources(){if(closed)return;closed=true;List<RailsWorker> all=new ArrayList<>();workers.drainTo(all);all.forEach(RailsWorker::close);engine.close();}
+  }
 
-        IsolateSupervisor(Settings settings, Source source, HttpSupport support) {
-            this.settings = settings;
-            this.source = source;
-            this.support = support;
-            synchronized (this) {
-                ensureMinimumLocked();
-            }
-            maintenance.scheduleAtFixedRate(this::maintainSafely, 1, 1, TimeUnit.SECONDS);
-        }
-
-        JsonNode invoke(ObjectNode envelope) throws Exception {
-            final RubyIsolate isolate;
-            synchronized (this) {
-                if (closed) {
-                    throw new IllegalStateException("supervisor is closed");
-                }
-                maintainLocked(System.currentTimeMillis());
-                isolate = selectLocked();
-            }
-            return isolate.submit(envelope).get(15, TimeUnit.SECONDS);
-        }
-
-        private RubyIsolate selectLocked() {
-            final List<RubyIsolate> accepting = isolates.stream()
-                .filter(RubyIsolate::isAccepting)
-                .sorted(Comparator.comparingInt(RubyIsolate::load))
-                .toList();
-            if (accepting.isEmpty()) {
-                final RubyIsolate created = createLocked();
-                isolates.add(created);
-                return created;
-            }
-
-            final RubyIsolate leastLoaded = accepting.get(0);
-            if (leastLoaded.load() >= settings.maxConcurrency && accepting.size() < settings.maxIsolates) {
-                final RubyIsolate created = createLocked();
-                isolates.add(created);
-                return created;
-            }
-            return leastLoaded;
-        }
-
-        private void maintainSafely() {
-            try {
-                synchronized (this) {
-                    if (!closed) {
-                        maintainLocked(System.currentTimeMillis());
-                    }
-                }
-            } catch (Throwable error) {
-                System.err.println("isolate maintenance failed: " + safeMessage(error));
-            }
-        }
-
-        private void maintainLocked(long now) {
-            int idleRetireBudget = Math.max(0, acceptingCountLocked() - settings.minIsolates);
-            for (RubyIsolate isolate : isolates) {
-                if (!isolate.isAccepting()) continue;
-                if (isolate.exceededMaxAge(now)) {
-                    isolate.beginRetirement();
-                } else if (idleRetireBudget > 0 && isolate.exceededIdle(now)) {
-                    isolate.beginRetirement();
-                    idleRetireBudget -= 1;
-                }
-            }
-
-            ensureMinimumLocked();
-
-            final List<RubyIsolate> removable = new ArrayList<>();
-            for (RubyIsolate isolate : isolates) {
-                if (isolate.isRetiring() && isolate.load() == 0) {
-                    isolate.close();
-                    removable.add(isolate);
-                }
-            }
-            isolates.removeAll(removable);
-            ensureMinimumLocked();
-        }
-
-        private long acceptingCountLocked() {
-            return isolates.stream().filter(RubyIsolate::isAccepting).count();
-        }
-
-        private void ensureMinimumLocked() {
-            while (!closed && acceptingCountLocked() < settings.minIsolates
-                && acceptingCountLocked() < settings.maxIsolates) {
-                isolates.add(createLocked());
-            }
-        }
-
-        private RubyIsolate createLocked() {
-            nextId += 1;
-            return new RubyIsolate("ruby-isolate-" + nextId, settings, source, support);
-        }
-
-        @Override
-        public synchronized void close() {
-            if (closed) return;
-            closed = true;
-            maintenance.shutdownNow();
-            for (RubyIsolate isolate : isolates) {
-                isolate.beginRetirement();
-                isolate.closeAfterDrain(settings.drainMillis);
-            }
-            isolates.clear();
-        }
+  static final class RailsWorker implements AutoCloseable {
+    final Context context; final Value invoke;
+    RailsWorker(Engine engine,Settings s,HttpBridge http) throws Exception {
+      IOAccess io=IOAccess.newBuilder().allowHostFileAccess(true).allowHostSocketAccess(false).build();
+      context=Context.newBuilder("ruby").engine(engine).allowAllAccess(false).allowHostAccess(HostAccess.EXPLICIT)
+        .allowHostClassLookup(n->false).allowHostClassLoading(false).allowNativeAccess(false).allowCreateProcess(false)
+        .allowCreateThread(false).allowEnvironmentAccess(EnvironmentAccess.NONE).allowIO(io).allowPolyglotAccess(PolyglotAccess.NONE)
+        .currentWorkingDirectory(s.appRoot).build();
+      Value b=context.getBindings("ruby"); b.putMember("gs_http",(ProxyExecutable)http::call); b.putMember("gs_app_root",s.appRoot.toString()); b.putMember("gs_rails_env",s.railsEnv);
+      Source boot=Source.newBuilder("ruby",Files.readString(s.bootstrap,StandardCharsets.UTF_8),"graal/bootstrap.rb").cached(true).build();
+      invoke=context.eval(boot); if(!invoke.canExecute()){context.close(true);throw new IllegalStateException("bootstrap did not return Rack invoker");}
     }
+    JsonNode invoke(ObjectNode request) throws Exception { Value v=invoke.execute(JSON.writeValueAsString(request)); return JSON.readTree(v.asString()); }
+    public void close(){context.close(true);}
+  }
 
-    static final class RubyIsolate implements AutoCloseable {
-        private final String id;
-        private final Settings settings;
-        private final Source source;
-        private final HttpSupport support;
-        private final Engine engine;
-        private final ThreadPoolExecutor pool;
-        private final long createdAt = System.currentTimeMillis();
-        private final AtomicLong lastUsedAt = new AtomicLong(createdAt);
-        private final AtomicInteger active = new AtomicInteger();
-        private volatile boolean accepting = true;
-        private volatile boolean closed;
+  static final class HttpBridge {
+    final URI base; final String token; final HttpClient client;
+    HttpBridge(String url,String token){base=URI.create(url.replaceAll("/$","")+"/");this.token=token;client=HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(2)).followRedirects(HttpClient.Redirect.NEVER).build();}
+    Object call(Value...args){try{JsonNode r=JSON.readTree(args[0].asString());String method=r.path("method").asText("GET").toUpperCase();String path=r.path("path").asText();if(!path.startsWith("/")||path.contains("://"))throw new IllegalArgumentException("relative HTTP path required");String q=query(r.path("query"));URI u=URI.create(base.toString().replaceAll("/$","")+path+(q.isEmpty()?"":"?"+q));if(!sameOrigin(base,u))throw new IllegalArgumentException("HTTP origin escape");JsonNode bn=r.get("body");String body=bn==null||bn.isNull()?"":JSON.writeValueAsString(bn);HttpRequest.Builder b=HttpRequest.newBuilder(u).timeout(Duration.ofSeconds(10)).header("accept","application/json").header("content-type","application/json");if(token!=null&&!token.isEmpty())b.header("authorization","Bearer "+token);b.method(method,body.isEmpty()?HttpRequest.BodyPublishers.noBody():HttpRequest.BodyPublishers.ofString(body));HttpResponse<InputStream> resp=client.send(b.build(),HttpResponse.BodyHandlers.ofInputStream());byte[] bytes;try(InputStream in=resp.body()){bytes=in.readNBytes(MAX_BODY+1);}if(bytes.length>MAX_BODY)throw new IllegalStateException("HTTP response too large");return JSON.writeValueAsString(JSON.createObjectNode().put("ok",true).put("status",resp.statusCode()).put("body",new String(bytes,StandardCharsets.UTF_8)));}catch(Exception e){try{return JSON.writeValueAsString(JSON.createObjectNode().put("ok",false).put("error",safe(e)));}catch(Exception x){return "{\"ok\":false,\"error\":\"bridge failure\"}";}}}
+    static String query(JsonNode q){if(q==null||!q.isObject()||q.isEmpty())return "";List<String> p=new ArrayList<>();q.fields().forEachRemaining(e->p.add(URLEncoder.encode(e.getKey(),StandardCharsets.UTF_8)+"="+URLEncoder.encode(e.getValue().asText(),StandardCharsets.UTF_8)));return String.join("&",p);}
+    static boolean sameOrigin(URI a,URI b){return a.getScheme().equalsIgnoreCase(b.getScheme())&&a.getHost().equalsIgnoreCase(b.getHost())&&port(a)==port(b);} static int port(URI u){return u.getPort()>=0?u.getPort():"https".equalsIgnoreCase(u.getScheme())?443:80;}
+  }
 
-        RubyIsolate(String id, Settings settings, Source source, HttpSupport support) {
-            this.id = id;
-            this.settings = settings;
-            this.source = source;
-            this.support = support;
-            this.engine = Engine.newBuilder("ruby")
-                .sandbox(SandboxPolicy.UNTRUSTED)
-                .spawnIsolate(true)
-                .option("engine.MaxIsolateMemory", "256MB")
-                .build();
-            this.pool = new ThreadPoolExecutor(
-                settings.maxConcurrency,
-                settings.maxConcurrency,
-                0L,
-                TimeUnit.MILLISECONDS,
-                new ArrayBlockingQueue<>(settings.maxConcurrency * 8),
-                namedThreads(id),
-                new ThreadPoolExecutor.AbortPolicy()
-            );
-        }
-
-        CompletableFuture<JsonNode> submit(ObjectNode envelope) {
-            if (!accepting || closed) {
-                throw new RejectedExecutionException(id + " is retiring");
-            }
-            lastUsedAt.set(System.currentTimeMillis());
-            final CompletableFuture<JsonNode> future = new CompletableFuture<>();
-            pool.execute(() -> {
-                active.incrementAndGet();
-                lastUsedAt.set(System.currentTimeMillis());
-                try {
-                    future.complete(invokeInFreshContext(envelope));
-                } catch (Throwable error) {
-                    future.completeExceptionally(error);
-                } finally {
-                    lastUsedAt.set(System.currentTimeMillis());
-                    active.decrementAndGet();
-                }
-            });
-            return future;
-        }
-
-        private JsonNode invokeInFreshContext(ObjectNode envelope) throws Exception {
-            try (Context context = Context.newBuilder("ruby")
-                .engine(engine)
-                .sandbox(SandboxPolicy.UNTRUSTED)
-                .allowAllAccess(false)
-                .allowHostAccess(HostAccess.UNTRUSTED)
-                .allowHostClassLookup(name -> false)
-                .allowHostClassLoading(false)
-                .allowNativeAccess(false)
-                .allowCreateProcess(false)
-                .allowCreateThread(false)
-                .allowEnvironmentAccess(EnvironmentAccess.NONE)
-                .allowIO(IOAccess.NONE)
-                .allowPolyglotAccess(PolyglotAccess.NONE)
-                .allowInnerContextOptions(false)
-                .option("sandbox.MaxHeapMemory", "96MB")
-                .option("sandbox.MaxCPUTime", "5s")
-                .option("sandbox.MaxASTDepth", "128")
-                .option("sandbox.MaxThreads", "1")
-                .option("sandbox.MaxOutputStreamSize", "1MB")
-                .option("sandbox.MaxErrorStreamSize", "1MB")
-                .build()) {
-                support.install(context);
-                context.eval(source);
-                final Value handler = context.eval("ruby", "method(:handler)");
-                if (!handler.canExecute()) {
-                    throw new IllegalStateException("Ruby handler is not executable");
-                }
-                final Value value = handler.execute(JSON.writeValueAsString(envelope));
-                if (!value.isString()) {
-                    throw new IllegalStateException("json-string-v1 handler must return a string");
-                }
-                return JSON.readTree(value.asString());
-            }
-        }
-
-        int load() {
-            return active.get() + pool.getQueue().size();
-        }
-
-        boolean isAccepting() {
-            return accepting && !closed;
-        }
-
-        boolean isRetiring() {
-            return !accepting && !closed;
-        }
-
-        boolean exceededMaxAge(long now) {
-            return now - createdAt >= settings.maxAgeMillis;
-        }
-
-        boolean exceededIdle(long now) {
-            return active.get() == 0 && pool.getQueue().isEmpty() && now - lastUsedAt.get() >= settings.idleMillis;
-        }
-
-        void beginRetirement() {
-            accepting = false;
-        }
-
-        void closeAfterDrain(long drainMillis) {
-            accepting = false;
-            pool.shutdown();
-            try {
-                if (!pool.awaitTermination(drainMillis, TimeUnit.MILLISECONDS)) {
-                    pool.shutdownNow();
-                }
-            } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
-                pool.shutdownNow();
-            }
-            closeEngine();
-        }
-
-        @Override
-        public void close() {
-            accepting = false;
-            pool.shutdown();
-            if (load() != 0) {
-                throw new IllegalStateException("cannot close isolate with queued or active requests");
-            }
-            closeEngine();
-        }
-
-        private synchronized void closeEngine() {
-            if (closed) return;
-            closed = true;
-            engine.close();
-        }
-    }
-
-    static final class HttpSupport {
-        private final URI baseUri;
-        private final String basePrefix;
-        private final String bearerToken;
-        private final java.net.http.HttpClient client;
-
-        HttpSupport(String dataApiUrl, String bearerToken) {
-            this.baseUri = URI.create(dataApiUrl);
-            this.basePrefix = dataApiUrl.endsWith("/") ? dataApiUrl : dataApiUrl + "/";
-            this.bearerToken = bearerToken;
-            this.client = java.net.http.HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(5))
-                .followRedirects(java.net.http.HttpClient.Redirect.NEVER)
-                .version(java.net.http.HttpClient.Version.HTTP_2)
-                .build();
-        }
-
-        void install(Context context) {
-            context.getBindings("ruby").putMember("gs_support_version", "gs-support-v1");
-            context.getBindings("ruby").putMember(
-                "gs_http",
-                (org.graalvm.polyglot.proxy.ProxyExecutable) this::httpCall
-            );
-        }
-
-        private Object httpCall(Value... args) {
-            try {
-                if (args.length != 1 || !args[0].isString()) {
-                    throw new IllegalArgumentException("gs_http expects one JSON string");
-                }
-                final JsonNode request = JSON.readTree(args[0].asString());
-                final String method = request.path("method").asText("GET").toUpperCase();
-                if (!List.of("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD").contains(method)) {
-                    throw new IllegalArgumentException("unsupported HTTP method");
-                }
-                final URI uri = URI.create(request.path("url").asText());
-                final String rendered = uri.toString();
-                if (!(rendered.equals(baseUri.toString()) || rendered.startsWith(basePrefix))) {
-                    throw new IllegalArgumentException("HTTP URL is outside the Data API grant");
-                }
-
-                final String body = request.path("body").isMissingNode() ? "" : request.path("body").asText("");
-                if (body.getBytes(StandardCharsets.UTF_8).length > MAX_BODY_BYTES) {
-                    throw new IllegalArgumentException("HTTP body too large");
-                }
-
-                final java.net.http.HttpRequest.Builder builder = java.net.http.HttpRequest.newBuilder(uri)
-                    .timeout(Duration.ofMillis(Math.min(30_000, Math.max(1, request.path("timeout_ms").asLong(10_000)))))
-                    .header("accept", "application/json")
-                    .header("content-type", "application/json");
-                if (!bearerToken.isBlank()) {
-                    builder.header("authorization", "Bearer " + bearerToken);
-                }
-                final java.net.http.HttpRequest.BodyPublisher publisher = body.isEmpty()
-                    ? java.net.http.HttpRequest.BodyPublishers.noBody()
-                    : java.net.http.HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8);
-                builder.method(method, publisher);
-
-                final java.net.http.HttpResponse<byte[]> response = client.send(
-                    builder.build(),
-                    java.net.http.HttpResponse.BodyHandlers.ofByteArray()
-                );
-                if (response.body().length > MAX_BODY_BYTES) {
-                    throw new IllegalStateException("HTTP response too large");
-                }
-                final ObjectNode result = JSON.createObjectNode();
-                result.put("ok", true);
-                result.put("status", response.statusCode());
-                result.put("body", new String(response.body(), StandardCharsets.UTF_8));
-                return JSON.writeValueAsString(result);
-            } catch (Exception error) {
-                final ObjectNode result = JSON.createObjectNode();
-                result.put("ok", false);
-                result.put("error", safeMessage(error));
-                try {
-                    return JSON.writeValueAsString(result);
-                } catch (Exception impossible) {
-                    return "{\"ok\":false,\"error\":\"serialization failure\"}";
-                }
-            }
-        }
-    }
-
-    static final class Router {
-        private final List<Route> routes;
-
-        private Router(List<Route> routes) {
-            this.routes = routes;
-        }
-
-        static Router load(Path path) throws IOException {
-            final JsonNode root = JSON.readTree(Files.readAllBytes(path));
-            if (!"ores-ror-routes-v1".equals(root.path("version").asText())) {
-                throw new IllegalArgumentException("unsupported route contract version");
-            }
-            final List<Route> routes = new ArrayList<>();
-            for (JsonNode node : root.path("routes")) {
-                routes.add(Route.compile(
-                    node.path("name").asText(),
-                    node.path("method").asText(),
-                    node.path("path").asText()
-                ));
-            }
-            return new Router(List.copyOf(routes));
-        }
-
-        RouteMatch match(String method, String path) {
-            for (Route route : routes) {
-                final RouteMatch match = route.match(method, path);
-                if (match != null) return match;
-            }
-            return null;
-        }
-    }
-
-    static final class Route {
-        private final String name;
-        private final String method;
-        private final java.util.regex.Pattern pattern;
-        private final List<String> paramNames;
-
-        private Route(String name, String method, java.util.regex.Pattern pattern, List<String> paramNames) {
-            this.name = name;
-            this.method = method;
-            this.pattern = pattern;
-            this.paramNames = paramNames;
-        }
-
-        static Route compile(String name, String method, String template) {
-            if (name.isBlank() || method.isBlank() || !template.startsWith("/")) {
-                throw new IllegalArgumentException("invalid route contract entry");
-            }
-            final StringBuilder regex = new StringBuilder("^");
-            final List<String> names = new ArrayList<>();
-            for (String segment : template.split("/", -1)) {
-                if (segment.isEmpty()) continue;
-                regex.append("/");
-                if (segment.startsWith(":")) {
-                    names.add(segment.substring(1));
-                    regex.append("([A-Za-z0-9_-]{1,128})");
-                } else {
-                    regex.append(java.util.regex.Pattern.quote(segment));
-                }
-            }
-            regex.append("$");
-            return new Route(name, method.toUpperCase(), java.util.regex.Pattern.compile(regex.toString()), List.copyOf(names));
-        }
-
-        RouteMatch match(String candidateMethod, String candidatePath) {
-            if (!method.equalsIgnoreCase(candidateMethod)) return null;
-            final java.util.regex.Matcher matcher = pattern.matcher(candidatePath);
-            if (!matcher.matches()) return null;
-            final Map<String, String> params = new HashMap<>();
-            for (int index = 0; index < paramNames.size(); index += 1) {
-                params.put(paramNames.get(index), matcher.group(index + 1));
-            }
-            return new RouteMatch(name, params);
-        }
-    }
-
-    static final class RouteMatch {
-        final String name;
-        final Map<String, String> params;
-
-        RouteMatch(String name, Map<String, String> params) {
-            this.name = name;
-            this.params = Map.copyOf(params);
-        }
-    }
+  static ThreadFactory named(String p){AtomicInteger n=new AtomicInteger();return r->new Thread(r,p+"-"+n.incrementAndGet());}
+  static String requestId(String v){return v!=null&&v.matches("[A-Za-z0-9._:-]{1,128}")?v:"ores-request-"+UUID.randomUUID();}
+  static String valueOr(String v,String d){return v==null||v.isBlank()?d:v;}
+  static String safe(Throwable e){Throwable r=e.getCause()!=null?e.getCause():e;String s=r.getMessage()==null?r.getClass().getSimpleName():r.getMessage();return s.length()>512?s.substring(0,512):s;}
 }
