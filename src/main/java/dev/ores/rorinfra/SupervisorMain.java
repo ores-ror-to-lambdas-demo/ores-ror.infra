@@ -103,6 +103,7 @@ public final class SupervisorMain {
             }
 
             final String requestId = safeRequestId(exchange.getRequestHeaders().getFirst("x-request-id"));
+            exchange.getResponseHeaders().set("x-request-id", requestId);
             final ObjectNode envelope = JSON.createObjectNode();
             envelope.put("request_id", requestId);
             envelope.put("route", match.name);
@@ -114,8 +115,12 @@ public final class SupervisorMain {
             parseQuery(exchange.getRequestURI().getRawQuery()).forEach(query::put);
 
             if (bodyBytes.length > 0) {
-                final JsonNode body = JSON.readTree(bodyBytes);
-                envelope.set("body", body == null ? JSON.nullNode() : body);
+                try {
+                    final JsonNode body = JSON.readTree(bodyBytes);
+                    envelope.set("body", body == null ? JSON.nullNode() : body);
+                } catch (IOException malformedJson) {
+                    throw new IllegalArgumentException("request body must be valid JSON");
+                }
             }
 
             final JsonNode result = supervisor.invoke(envelope);
@@ -297,7 +302,7 @@ public final class SupervisorMain {
             synchronized (this) {
                 ensureMinimumLocked();
             }
-            maintenance.scheduleAtFixedRate(this::maintainSafely, 10, 10, TimeUnit.SECONDS);
+            maintenance.scheduleAtFixedRate(this::maintainSafely, 1, 1, TimeUnit.SECONDS);
         }
 
         JsonNode invoke(ObjectNode envelope) throws Exception {
@@ -324,7 +329,7 @@ public final class SupervisorMain {
             }
 
             final RubyIsolate leastLoaded = accepting.get(0);
-            if (leastLoaded.load() >= settings.maxConcurrency && isolates.size() < settings.maxIsolates) {
+            if (leastLoaded.load() >= settings.maxConcurrency && accepting.size() < settings.maxIsolates) {
                 final RubyIsolate created = createLocked();
                 isolates.add(created);
                 return created;
@@ -345,24 +350,22 @@ public final class SupervisorMain {
         }
 
         private void maintainLocked(long now) {
-            boolean needsReplacement = false;
+            int idleRetireBudget = Math.max(0, acceptingCountLocked() - settings.minIsolates);
             for (RubyIsolate isolate : isolates) {
+                if (!isolate.isAccepting()) continue;
                 if (isolate.exceededMaxAge(now)) {
                     isolate.beginRetirement();
-                    needsReplacement = true;
-                } else if (isolates.size() > settings.minIsolates && isolate.exceededIdle(now)) {
+                } else if (idleRetireBudget > 0 && isolate.exceededIdle(now)) {
                     isolate.beginRetirement();
+                    idleRetireBudget -= 1;
                 }
             }
 
-            if (needsReplacement && isolates.stream().noneMatch(RubyIsolate::isAccepting)
-                && isolates.size() < settings.maxIsolates) {
-                isolates.add(createLocked());
-            }
+            ensureMinimumLocked();
 
             final List<RubyIsolate> removable = new ArrayList<>();
             for (RubyIsolate isolate : isolates) {
-                if (isolate.isRetiring() && isolate.active() == 0) {
+                if (isolate.isRetiring() && isolate.load() == 0) {
                     isolate.close();
                     removable.add(isolate);
                 }
@@ -371,9 +374,13 @@ public final class SupervisorMain {
             ensureMinimumLocked();
         }
 
+        private long acceptingCountLocked() {
+            return isolates.stream().filter(RubyIsolate::isAccepting).count();
+        }
+
         private void ensureMinimumLocked() {
-            while (!closed && isolates.stream().filter(RubyIsolate::isAccepting).count() < settings.minIsolates
-                && isolates.size() < settings.maxIsolates) {
+            while (!closed && acceptingCountLocked() < settings.minIsolates
+                && acceptingCountLocked() < settings.maxIsolates) {
                 isolates.add(createLocked());
             }
         }
@@ -491,10 +498,6 @@ public final class SupervisorMain {
             return active.get() + pool.getQueue().size();
         }
 
-        int active() {
-            return active.get();
-        }
-
         boolean isAccepting() {
             return accepting && !closed;
         }
@@ -533,9 +536,10 @@ public final class SupervisorMain {
         public void close() {
             accepting = false;
             pool.shutdown();
-            if (active.get() == 0 && pool.getQueue().isEmpty()) {
-                closeEngine();
+            if (load() != 0) {
+                throw new IllegalStateException("cannot close isolate with queued or active requests");
             }
+            closeEngine();
         }
 
         private synchronized void closeEngine() {
@@ -563,10 +567,7 @@ public final class SupervisorMain {
         }
 
         void install(Context context) {
-            context.getBindings("ruby").putMember(
-                "gs_support_version",
-                "gs-support-v1"
-            );
+            context.getBindings("ruby").putMember("gs_support_version", "gs-support-v1");
             context.getBindings("ruby").putMember(
                 "gs_http",
                 (org.graalvm.polyglot.proxy.ProxyExecutable) this::httpCall
