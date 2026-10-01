@@ -212,7 +212,7 @@ public final class SupervisorMain {
         b.putMember("gs_http",(ProxyExecutable)http::call);
         b.putMember("gs_app_root",s.appRoot.toString());
         b.putMember("gs_rails_env",s.railsEnv);
-        Source boot=Source.newBuilder("ruby",Files.readString(s.bootstrap,StandardCharsets.UTF_8),"graal/bootstrap.rb").cached(true).build();
+        Source boot=Source.newBuilder("ruby",Files.readString(s.bootstrap,StandardCharsets.UTF_8),"graal/bootstrap.rb").interactive(true).cached(true).build();
         candidateInvoke=candidate.eval(boot);
         if(!candidateInvoke.canExecute()) throw new IllegalStateException("bootstrap did not return Rack invoker");
       }catch(Exception e){
