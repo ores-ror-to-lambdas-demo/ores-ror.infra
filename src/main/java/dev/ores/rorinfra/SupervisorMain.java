@@ -205,7 +205,7 @@ public final class SupervisorMain {
       Context candidate=Context.newBuilder("ruby").engine(engine).allowAllAccess(false).allowHostAccess(HostAccess.EXPLICIT)
         .allowHostClassLookup(n->false).allowHostClassLoading(false).allowNativeAccess(false).allowCreateProcess(false)
         .allowCreateThread(false).allowEnvironmentAccess(EnvironmentAccess.NONE).allowIO(io).allowPolyglotAccess(PolyglotAccess.NONE)
-        .currentWorkingDirectory(s.appRoot).build();
+        .option("ruby.platform-native","false").currentWorkingDirectory(s.appRoot).build();
       Value candidateInvoke=null;
       try{
         Value b=candidate.getBindings("ruby");
