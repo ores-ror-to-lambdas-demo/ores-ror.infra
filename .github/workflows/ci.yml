@@ -7,7 +7,7 @@ on:
 permissions:
   contents: read
 jobs:
-  embedded-rails-cluster:
+  graal-lambda-worker-cluster:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -15,27 +15,51 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: ores-ror-to-lambdas-demo/ores-ror.rb
+          ref: feat/filesystem-route-handlers
           path: app
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: truffleruby+graalvm-34.0.1
           bundler-cache: false
           working-directory: app
-      - name: Install Rails gems for embedded TruffleRuby
+      - name: Install Rails-free TruffleRuby worker bundle
         working-directory: app
-        run: BUNDLE_PATH=vendor/bundle-truffleruby bundle install --jobs 4 --retry 3
+        env:
+          BUNDLE_PATH: vendor/bundle-truffleruby
+          BUNDLE_WITHOUT: rails:test
+        run: |
+          bundle install --jobs 4 --retry 3
+          ruby -e 'abort "Rails gem leaked into Graal worker bundle" unless Gem::Specification.find_all_by_name("rails").empty?'
+      - name: Build URL-shaped lambda handlers for Graal workers
+        working-directory: app
+        env:
+          BUNDLE_PATH: vendor/bundle-truffleruby
+          BUNDLE_WITHOUT: rails:test
+          ORES_BUILD_TARGET: lambda
+          ORES_LAMBDA_HANDLER_GRANULARITY: route
+        run: |
+          bundle exec ruby bin/build-runtime
+          test -f generated/lambda/entrypoint.rb
+          test -f 'generated/lambda/routes/users/[id]/handler.rb'
+          test -f 'generated/lambda/routes/orders/[id]/cancel/handler.rb'
+          test -f 'routes/users/[id]/handler.rb'
+          test -f 'routes/orders/[id]/cancel/handler.rb'
+          ! grep -R -E 'config/environment|Rails\.application' generated/lambda routes graal/bootstrap.rb
       - uses: actions/setup-java@v4
         with:
           distribution: graalvm
           java-version: '21'
           cache: maven
-      - name: Build and test 2-cell / 6-worker cluster
+      - name: Build and test 2-cell / 6-worker Rails-free Graal cluster
+        env:
+          ORES_BUILD_TARGET: lambda
         run: mvn -f infra/pom.xml -Dapp.root="$GITHUB_WORKSPACE/app" test
       - name: Package runnable supervisor
         run: mvn -f infra/pom.xml -DskipTests package
-      - name: Boot real Graal Rails cluster and smoke HTTP
+      - name: Boot real Graal worker cluster and smoke HTTP
         env:
           APP_ROOT: ${{ github.workspace }}/app
+          ORES_BUILD_TARGET: lambda
           PORT: '3200'
           MIN_ISOLATES: '2'
           MAX_ISOLATES: '3'
@@ -45,11 +69,13 @@ jobs:
           java -jar infra/target/ores-ror-infra-0.3.0.jar >graal-cluster.log 2>&1 &
           echo $! > graal.pid
           for n in $(seq 1 90); do
-            if curl --fail --silent http://127.0.0.1:3200/healthz >health.json; then break; fi
+            if curl --fail --silent -H 'x-request-id: graal-health' http://127.0.0.1:3200/healthz >health.json; then break; fi
             sleep 1
           done
           cat health.json
-          grep -q 'truffleruby-graal' health.json
+          grep -q '"runtime":"truffleruby-graal-lambda"' health.json
+          grep -q '"execution_mode":"lambda"' health.json
+          grep -q '"request_id":"graal-health"' health.json
           seq 1 24 | xargs -P 12 -I{} curl --fail --silent -H 'x-request-id: smoke-{}' http://127.0.0.1:3200/healthz >/dev/null
           kill $(cat graal.pid)
       - name: Show cluster log on failure
