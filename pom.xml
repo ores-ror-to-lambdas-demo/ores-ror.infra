@@ -9,7 +9,8 @@
   <properties>
     <maven.compiler.release>21</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    <graalvm.version>25.0.0</graalvm.version>
+    <polyglot.version>25.0.2</polyglot.version>
+    <truffleruby.version>34.0.1</truffleruby.version>
     <jackson.version>2.18.3</jackson.version>
     <junit.version>5.11.4</junit.version>
   </properties>
@@ -17,12 +18,12 @@
     <dependency>
       <groupId>org.graalvm.polyglot</groupId>
       <artifactId>polyglot</artifactId>
-      <version>${graalvm.version}</version>
+      <version>${polyglot.version}</version>
     </dependency>
     <dependency>
-      <groupId>org.graalvm.polyglot</groupId>
-      <artifactId>ruby-community</artifactId>
-      <version>${graalvm.version}</version>
+      <groupId>dev.truffleruby</groupId>
+      <artifactId>truffleruby</artifactId>
+      <version>${truffleruby.version}</version>
       <type>pom</type>
     </dependency>
     <dependency>
