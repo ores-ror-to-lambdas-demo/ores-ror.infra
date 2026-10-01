@@ -223,7 +223,7 @@ public final class SupervisorMain {
         .allowCreateThread(false).allowEnvironmentAccess(EnvironmentAccess.NONE).allowIO(io).allowPolyglotAccess(PolyglotAccess.NONE)
         .currentWorkingDirectory(s.appRoot).build();
       Value b=context.getBindings("ruby"); b.putMember("gs_http",(ProxyExecutable)http::call); b.putMember("gs_app_root",s.appRoot.toString()); b.putMember("gs_rails_env",s.railsEnv);
-      Source boot=Source.newBuilder("ruby",Files.readString(s.bootstrap,StandardCharsets.UTF_8),"graal/bootstrap.rb").cached(true).build();
+      Source boot=Source.newBuilder("ruby",Files.readString(s.bootstrap,StandardCharsets.UTF_8),"graal/bootstrap.rb").interactive(true).cached(true).build();
       invoke=context.eval(boot); if(!invoke.canExecute()){context.close(true);throw new IllegalStateException("bootstrap did not return Rack invoker");}
     }
     JsonNode invoke(ObjectNode request) throws Exception { Value v=invoke.execute(JSON.writeValueAsString(request)); return JSON.readTree(v.asString()); }
