@@ -52,6 +52,8 @@ jobs:
           grep -Fq '"route_source": "Rails.application.routes"' generated/lambda/manifest.json
           grep -Fq '"controller": "users/show/endpoint"' generated/lambda/manifest.json
           grep -Fq '"action": "show"' generated/lambda/manifest.json
+          grep -Fq '"handler_constant": "Users::Show::Handler"' generated/lambda/manifest.json
+          grep -Fq 'module Handler' app/controllers/users/show/handler.rb
           ! find generated/lambda -name '*.rb' -print0 | xargs -0 grep -E 'config/environment|Rails\.application'
           ! find app/controllers -name handler.rb -print0 | xargs -0 grep -E 'config/environment|Rails\.application'
 
