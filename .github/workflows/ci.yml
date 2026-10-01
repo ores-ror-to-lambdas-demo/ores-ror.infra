@@ -54,6 +54,7 @@ jobs:
           grep -Fq '"action": "show"' generated/lambda/manifest.json
           grep -Fq '"handler_constant": "Users::Show::Handler"' generated/lambda/manifest.json
           grep -Fq 'module Handler' app/controllers/users/show/handler.rb
+          BUNDLE_PATH=vendor/bundle-codegen bundle exec rails runner 'Rails.application.eager_load!; abort "generated handler not Zeitwerk-loadable" unless defined?(Users::Show::Handler)'
           ! find generated/lambda -name '*.rb' -print0 | xargs -0 grep -E 'config/environment|Rails\.application'
           ! find app/controllers -name handler.rb -print0 | xargs -0 grep -E 'config/environment|Rails\.application'
 
