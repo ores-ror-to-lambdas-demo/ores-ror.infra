@@ -15,7 +15,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: ores-ror-to-lambdas-demo/ores-ror.rb
-          ref: feat/colocated-rails-endpoint-handlers
+          ref: main
           path: app
       - uses: ruby/setup-ruby@v1
         with:
@@ -30,7 +30,7 @@ jobs:
         run: |
           bundle install --jobs 4 --retry 3
           ruby -e 'abort "Rails gem leaked into Graal worker bundle" unless Gem::Specification.find_all_by_name("rails").empty?'
-      - name: Generate co-located endpoint handlers for Graal workers
+      - name: Verify committed URL-shaped route sources and generate worker wrappers
         working-directory: app
         env:
           BUNDLE_PATH: vendor/bundle-truffleruby
@@ -38,16 +38,23 @@ jobs:
           ORES_BUILD_TARGET: lambda
           ORES_LAMBDA_HANDLER_GRANULARITY: route
         run: |
+          test -f 'routes/users/[id]/handler.rb'
+          test -f 'routes/orders/[id]/handler.rb'
+          test -f 'routes/orders/[id]/cancel/handler.rb'
+          test -f 'routes/profiles/[id]/preferences/handler.rb'
+          test "$(find routes -name handler.rb | wc -l)" -eq 13
+          git ls-files | grep -Fx 'routes/users/[id]/handler.rb'
+          git ls-files | grep -Fx 'routes/orders/[id]/cancel/handler.rb'
+
           bundle exec ruby bin/build-runtime
+
           test -f generated/lambda/entrypoint.rb
-          test -f app/controllers/users/show/endpoint_controller.rb
-          test -f app/controllers/users/show/handler.rb
-          test -f app/controllers/orders/cancel/endpoint_controller.rb
-          test -f app/controllers/orders/cancel/handler.rb
-          git -C . check-ignore -q app/controllers/users/show/handler.rb
-          test ! -d routes
-          ! grep -R -E 'config/environment|Rails\.application' generated/lambda graal/bootstrap.rb
-          ! find app/controllers -name handler.rb -print0 | xargs -0 grep -E 'config/environment|Rails\.application'
+          test -f 'generated/lambda/routes/users/[id]/handler.rb'
+          test -f 'generated/lambda/routes/orders/[id]/cancel/handler.rb'
+          grep -Fq 'OresApp::RouteHandlers.call' 'generated/lambda/routes/users/[id]/handler.rb'
+          grep -Fq '"source_handler": "routes/users/[id]/handler.rb"' generated/lambda/manifest.json
+          grep -Fq '"source_handler": "routes/orders/[id]/cancel/handler.rb"' generated/lambda/manifest.json
+          ! grep -R -E 'config/environment|Rails\.application' generated/lambda graal/bootstrap.rb routes
       - uses: actions/setup-java@v4
         with:
           distribution: graalvm
