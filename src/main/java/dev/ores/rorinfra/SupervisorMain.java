@@ -20,10 +20,11 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
@@ -193,41 +194,46 @@ public final class SupervisorMain {
   }
 
   static final class Cell implements AutoCloseable {
-    final String id; final Settings s; final Engine engine; final BlockingQueue<RailsWorker> workers;
-    final ThreadPoolExecutor pool; final long born=System.currentTimeMillis(); final AtomicLong last=new AtomicLong(born);
+    final String id; final Settings s; final Engine engine; final Context context; final Value invoke;
+    final ThreadPoolExecutor pool; final Set<String> hostThreads=ConcurrentHashMap.newKeySet();
+    final long born=System.currentTimeMillis(); final AtomicLong last=new AtomicLong(born);
     final AtomicInteger active=new AtomicInteger(); volatile boolean open=true; volatile boolean closed;
 
     Cell(String id,Settings s,HttpBridge http) throws Exception {
-      this.id=id; this.s=s; this.engine=Engine.newBuilder("ruby").build(); this.workers=new ArrayBlockingQueue<>(s.workersPerCell);
-      try{ for(int i=0;i<s.workersPerCell;i++) workers.add(new RailsWorker(engine,s,http)); }
-      catch(Exception e){workers.forEach(RailsWorker::close);engine.close();throw e;}
+      this.id=id; this.s=s; this.engine=Engine.newBuilder("ruby").build();
+      IOAccess io=IOAccess.newBuilder().allowHostFileAccess(true).allowHostSocketAccess(false).build();
+      Context candidate=Context.newBuilder("ruby").engine(engine).allowAllAccess(false).allowHostAccess(HostAccess.EXPLICIT)
+        .allowHostClassLookup(n->false).allowHostClassLoading(false).allowNativeAccess(false).allowCreateProcess(false)
+        .allowCreateThread(false).allowEnvironmentAccess(EnvironmentAccess.NONE).allowIO(io).allowPolyglotAccess(PolyglotAccess.NONE)
+        .currentWorkingDirectory(s.appRoot).build();
+      Value candidateInvoke=null;
+      try{
+        Value b=candidate.getBindings("ruby");
+        b.putMember("gs_http",(ProxyExecutable)http::call);
+        b.putMember("gs_app_root",s.appRoot.toString());
+        b.putMember("gs_rails_env",s.railsEnv);
+        Source boot=Source.newBuilder("ruby",Files.readString(s.bootstrap,StandardCharsets.UTF_8),"graal/bootstrap.rb").cached(true).build();
+        candidateInvoke=candidate.eval(boot);
+        if(!candidateInvoke.canExecute()) throw new IllegalStateException("bootstrap did not return Rack invoker");
+      }catch(Exception e){
+        candidate.close(true);
+        engine.close();
+        throw e;
+      }
+      this.context=candidate;
+      this.invoke=candidateInvoke;
       this.pool=new ThreadPoolExecutor(s.workersPerCell,s.workersPerCell,0,TimeUnit.MILLISECONDS,
         new ArrayBlockingQueue<>(s.workersPerCell*8),named(id),new ThreadPoolExecutor.AbortPolicy());
     }
 
     CompletableFuture<JsonNode> submit(ObjectNode req){ if(!accepting())throw new RejectedExecutionException("cell retiring"); last.set(System.currentTimeMillis());
-      CompletableFuture<JsonNode> f=new CompletableFuture<>(); pool.execute(()->{RailsWorker w=null;active.incrementAndGet();try{w=workers.take();f.complete(w.invoke(req));}catch(Throwable e){f.completeExceptionally(e);}finally{if(w!=null&&!closed)workers.offer(w);active.decrementAndGet();last.set(System.currentTimeMillis());}});return f; }
+      CompletableFuture<JsonNode> f=new CompletableFuture<>(); pool.execute(()->{active.incrementAndGet();hostThreads.add(Thread.currentThread().getName());try{Value v=invoke.execute(JSON.writeValueAsString(req));f.complete(JSON.readTree(v.asString()));}catch(Throwable e){f.completeExceptionally(e);}finally{active.decrementAndGet();last.set(System.currentTimeMillis());}});return f; }
     int load(){return active.get()+pool.getQueue().size();} boolean accepting(){return open&&!closed;} boolean retiring(){return !open&&!closed;}
     boolean old(long n){return n-born>=s.maxAgeMs;} boolean idle(long n){return load()==0&&n-last.get()>=s.idleMs;} void retire(){open=false;pool.shutdown();}
+    int contextIdentity(){return System.identityHashCode(context);} int hostThreadCount(){return hostThreads.size();}
     void closeAfterDrain(){open=false;pool.shutdown();try{if(!pool.awaitTermination(s.drainMs,TimeUnit.MILLISECONDS))pool.shutdownNow();}catch(InterruptedException e){Thread.currentThread().interrupt();pool.shutdownNow();}closeResources();}
     public void close(){open=false;pool.shutdown();if(load()!=0)throw new IllegalStateException("cell busy");closeResources();}
-    synchronized void closeResources(){if(closed)return;closed=true;List<RailsWorker> all=new ArrayList<>();workers.drainTo(all);all.forEach(RailsWorker::close);engine.close();}
-  }
-
-  static final class RailsWorker implements AutoCloseable {
-    final Context context; final Value invoke;
-    RailsWorker(Engine engine,Settings s,HttpBridge http) throws Exception {
-      IOAccess io=IOAccess.newBuilder().allowHostFileAccess(true).allowHostSocketAccess(false).build();
-      context=Context.newBuilder("ruby").engine(engine).allowAllAccess(false).allowHostAccess(HostAccess.EXPLICIT)
-        .allowHostClassLookup(n->false).allowHostClassLoading(false).allowNativeAccess(false).allowCreateProcess(false)
-        .allowCreateThread(false).allowEnvironmentAccess(EnvironmentAccess.NONE).allowIO(io).allowPolyglotAccess(PolyglotAccess.NONE)
-        .currentWorkingDirectory(s.appRoot).build();
-      Value b=context.getBindings("ruby"); b.putMember("gs_http",(ProxyExecutable)http::call); b.putMember("gs_app_root",s.appRoot.toString()); b.putMember("gs_rails_env",s.railsEnv);
-      Source boot=Source.newBuilder("ruby",Files.readString(s.bootstrap,StandardCharsets.UTF_8),"graal/bootstrap.rb").cached(true).build();
-      invoke=context.eval(boot); if(!invoke.canExecute()){context.close(true);throw new IllegalStateException("bootstrap did not return Rack invoker");}
-    }
-    JsonNode invoke(ObjectNode request) throws Exception { Value v=invoke.execute(JSON.writeValueAsString(request)); return JSON.readTree(v.asString()); }
-    public void close(){context.close(true);}
+    synchronized void closeResources(){if(closed)return;closed=true;context.close(true);engine.close();}
   }
 
   static final class HttpBridge {
