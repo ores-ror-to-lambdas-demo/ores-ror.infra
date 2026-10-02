@@ -585,7 +585,6 @@ public final class SupervisorMain {
       return Context.newBuilder("ruby")
         .engine(engine)
         .allowExperimentalOptions(true)
-        .option("ruby.platform-native", "false")
         .allowAllAccess(false)
         .allowHostAccess(HostAccess.EXPLICIT)
         .allowHostClassLookup(name -> false)
