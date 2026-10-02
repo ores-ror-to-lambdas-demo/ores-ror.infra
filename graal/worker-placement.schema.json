@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ores-ror-to-lambdas-demo/ores-ror.infra/blob/main/graal/worker-placement.schema.json",
+  "title": "Ores GraalWorker placement",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema"],
+  "properties": {
+    "schema": {
+      "const": "ores-graal-worker-placement/v1"
+    },
+    "default_strategy": {
+      "type": "string",
+      "enum": ["route", "group"],
+      "default": "route"
+    },
+    "startup": {
+      "type": "string",
+      "enum": ["lazy", "eager"],
+      "default": "lazy"
+    },
+    "route_assignments": {
+      "type": "object",
+      "description": "Map generated route_id values to generated isolate-unit keys.",
+      "propertyNames": {
+        "minLength": 1,
+        "maxLength": 256
+      },
+      "additionalProperties": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 288
+      },
+      "default": {}
+    },
+    "route_identity_assignments": {
+      "type": "object",
+      "description": "Map human-readable METHOD /path identities to generated isolate-unit keys.",
+      "propertyNames": {
+        "minLength": 1,
+        "maxLength": 2064
+      },
+      "additionalProperties": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 288
+      },
+      "default": {}
+    }
+  }
+}

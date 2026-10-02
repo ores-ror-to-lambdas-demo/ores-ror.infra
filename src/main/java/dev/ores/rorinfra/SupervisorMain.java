@@ -27,6 +27,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -96,10 +97,11 @@ public final class SupervisorMain {
       }, "ror-shutdown"));
       server.start();
       System.out.printf(
-        "TruffleRuby/Graal listening on http://%s:%d granularity=%s isolates=%d contexts/isolate=1 guest-owner-threads/context=1 admission-limit/context=%d shared-engine=1%n",
+        "TruffleRuby/Graal listening on http://%s:%d worker-placement=%s startup=%s selected-workers=%d contexts/worker=1 admission-limit/context=%d shared-engine=1%n",
         settings.bindHost,
         settings.port,
-        settings.granularity,
+        settings.placement.defaultStrategy,
+        settings.placement.startup,
         settings.unitCount(),
         settings.workersPerIsolate);
       Thread.currentThread().join();
@@ -246,12 +248,103 @@ public final class SupervisorMain {
     }
   }
 
+  static final class WorkerPlacement {
+    static final String SCHEMA = "ores-graal-worker-placement/v1";
+
+    final String defaultStrategy;
+    final String startup;
+    final Map<String, String> routeAssignments;
+    final Map<String, String> routeIdentityAssignments;
+
+    WorkerPlacement(
+      String defaultStrategy,
+      String startup,
+      Map<String, String> routeAssignments,
+      Map<String, String> routeIdentityAssignments
+    ) {
+      this.defaultStrategy = defaultStrategy;
+      this.startup = startup;
+      this.routeAssignments = Map.copyOf(routeAssignments);
+      this.routeIdentityAssignments = Map.copyOf(routeIdentityAssignments);
+      if (!List.of("route", "group").contains(defaultStrategy)) {
+        throw new IllegalArgumentException("worker placement default_strategy must be route or group");
+      }
+      if (!List.of("lazy", "eager").contains(startup)) {
+        throw new IllegalArgumentException("worker placement startup must be lazy or eager");
+      }
+    }
+
+    static WorkerPlacement fromEnv(Path appRoot) {
+      String configured = Settings.env("GRAAL_WORKER_PLACEMENT_FILE", "").trim();
+      if (configured.isEmpty()) {
+        String legacy = Settings.env("GRAAL_WORKER_PLACEMENT", Settings.env("ISOLATION_GRANULARITY", "route")).toLowerCase(Locale.ROOT);
+        String startup = Settings.env("GRAAL_WORKER_STARTUP", "lazy").toLowerCase(Locale.ROOT);
+        return new WorkerPlacement(legacy, startup, Map.of(), Map.of());
+      }
+
+      Path path = Path.of(configured);
+      if (!path.isAbsolute()) path = appRoot.resolve(path);
+      path = path.toAbsolutePath().normalize();
+      try {
+        if (Files.isSymbolicLink(path)) {
+          throw new IllegalArgumentException("GRAAL_WORKER_PLACEMENT_FILE may not be a symlink");
+        }
+        Path real = path.toRealPath();
+        if (!Files.isRegularFile(real)) {
+          throw new IllegalArgumentException("GRAAL_WORKER_PLACEMENT_FILE must be a regular file");
+        }
+        if (Files.size(real) > 256 * 1024) {
+          throw new IllegalArgumentException("worker placement file exceeds 256 KiB");
+        }
+        JsonNode root = JSON.readTree(Files.readString(real, StandardCharsets.UTF_8));
+        if (!SCHEMA.equals(root.path("schema").asText())) {
+          throw new IllegalArgumentException("unsupported worker placement schema");
+        }
+        String defaultStrategy = root.path("default_strategy").asText("route").toLowerCase(Locale.ROOT);
+        String startup = root.path("startup").asText("lazy").toLowerCase(Locale.ROOT);
+        Map<String, String> assignments = parseAssignmentObject(root.path("route_assignments"), "route_assignments", MAX_IDENTIFIER);
+        Map<String, String> identities = parseAssignmentObject(root.path("route_identity_assignments"), "route_identity_assignments", MAX_ROUTE_PATH + 16);
+        return new WorkerPlacement(defaultStrategy, startup, assignments, identities);
+      } catch (IOException error) {
+        throw new IllegalArgumentException("cannot read GRAAL_WORKER_PLACEMENT_FILE: " + path, error);
+      }
+    }
+
+    static Map<String, String> parseAssignmentObject(JsonNode node, String label, int maxSelectorLength) {
+      if (node.isMissingNode() || node.isNull()) return Map.of();
+      if (!node.isObject()) throw new IllegalArgumentException("worker placement " + label + " must be an object");
+      Map<String, String> parsed = new LinkedHashMap<>();
+      node.fields().forEachRemaining(entry -> {
+        String selector = entry.getKey();
+        String unitKey = entry.getValue().asText();
+        if (selector.isBlank() || selector.length() > maxSelectorLength
+            || unitKey.isBlank() || unitKey.length() > MAX_IDENTIFIER + 32) {
+          throw new IllegalArgumentException("worker placement contains an invalid selector/unit key");
+        }
+        parsed.put(selector, unitKey);
+      });
+      return parsed;
+    }
+
+    String unitKey(RouteDef route) {
+      String assigned = routeAssignments.get(route.routeId);
+      if (assigned != null) return assigned;
+      assigned = routeIdentityAssignments.get(route.verb + " " + route.path);
+      if (assigned != null) return assigned;
+      return "group".equals(defaultStrategy) ? "group:" + route.group : "route:" + route.routeId;
+    }
+
+    boolean eager() {
+      return "eager".equals(startup);
+    }
+  }
+
   static final class Settings {
     final String bindHost;
     final int port;
     final Path appRoot;
     final Path manifestPath;
-    final String granularity;
+    final WorkerPlacement placement;
     final String dataUrl;
     final String dataToken;
     final int workersPerIsolate;
@@ -270,7 +363,7 @@ public final class SupervisorMain {
       int port,
       Path appRoot,
       Path manifestPath,
-      String granularity,
+      WorkerPlacement placement,
       String dataUrl,
       String dataToken,
       int workersPerIsolate,
@@ -284,7 +377,7 @@ public final class SupervisorMain {
       this.port = port;
       this.appRoot = appRoot.toAbsolutePath().normalize();
       this.manifestPath = manifestPath.toAbsolutePath().normalize();
-      this.granularity = granularity;
+      this.placement = placement;
       this.dataUrl = dataUrl;
       this.dataToken = dataToken;
       this.workersPerIsolate = workersPerIsolate;
@@ -293,9 +386,7 @@ public final class SupervisorMain {
       this.drainMs = drainMs;
       this.requestTimeoutMs = requestTimeoutMs;
       this.exposeDiagnostics = exposeDiagnostics;
-      if (!List.of("route", "group").contains(granularity)) {
-        throw new IllegalArgumentException("ISOLATION_GRANULARITY must be route or group");
-      }
+      Objects.requireNonNull(placement, "placement");
       URI uri = URI.create(dataUrl);
       if (!List.of("http", "https").contains(uri.getScheme())
           || uri.getHost() == null
@@ -329,12 +420,14 @@ public final class SupervisorMain {
         Path commonPath = resolveArtifact(manifest.path("shared_source").asText());
         this.commonSource = readRubySource(commonPath, "shared Graal source");
         this.routes = parseRoutes(manifest);
-        this.units = parseUnits(manifest, granularity);
+        this.units = parseUnits(manifest);
+        validateUnitDefinitions();
+        validatePlacement();
       } catch (IOException error) {
         throw new IllegalArgumentException("cannot read generated Graal manifest: " + this.manifestPath, error);
       }
       if (routes.isEmpty()) throw new IllegalArgumentException("Graal manifest contains no routes");
-      if (units.isEmpty()) throw new IllegalArgumentException("Graal manifest contains no " + granularity + " isolate units");
+      if (units.isEmpty()) throw new IllegalArgumentException("Graal manifest contains no isolate units");
     }
 
     static Settings fromEnv() {
@@ -345,7 +438,7 @@ public final class SupervisorMain {
         integer("PORT", 8080, 1, 65535),
         appRoot,
         manifest,
-        env("ISOLATION_GRANULARITY", "route").toLowerCase(),
+        WorkerPlacement.fromEnv(appRoot),
         env("DATA_API_URL", "http://127.0.0.1:8787/v1"),
         env("DATA_API_TOKEN", ""),
         integerAliases("CONTEXT_THREAD_POOL_SIZE", List.of("CONTEXT_ADMISSION_LIMIT", "CONTEXT_MAX_CONCURRENCY", "ISOLATE_MAX_CONCURRENCY"), 5, 1, 5),
@@ -357,13 +450,17 @@ public final class SupervisorMain {
     }
 
     static Settings test(Path appRoot, String granularity, int workers) {
+      return test(appRoot, new WorkerPlacement(granularity, "lazy", Map.of(), Map.of()), workers);
+    }
+
+    static Settings test(Path appRoot, WorkerPlacement placement, int workers) {
       Path root = appRoot.toAbsolutePath().normalize();
       return new Settings(
         "127.0.0.1",
         0,
         root,
         root.resolve("generated/graal/manifest.json"),
-        granularity,
+        placement,
         "http://127.0.0.1:9/v1",
         "",
         workers,
@@ -375,7 +472,13 @@ public final class SupervisorMain {
     }
 
     int unitCount() {
-      return units.size();
+      return selectedUnitKeys().size();
+    }
+
+    Set<String> selectedUnitKeys() {
+      Set<String> selected = new java.util.LinkedHashSet<>();
+      for (RouteDef route : routes) selected.add(placement.unitKey(route));
+      return Set.copyOf(selected);
     }
 
     RouteDef resolveRoute(String method, String path) {
@@ -386,13 +489,52 @@ public final class SupervisorMain {
     }
 
     String unitKey(RouteDef route) {
-      return granularity.equals("route") ? "route:" + route.routeId : "group:" + route.group;
+      return placement.unitKey(route);
     }
 
     UnitDef unitFor(RouteDef route) {
-      UnitDef unit = units.get(unitKey(route));
-      if (unit == null) throw new IllegalStateException("missing isolate unit " + unitKey(route));
+      String key = unitKey(route);
+      UnitDef unit = units.get(key);
+      if (unit == null) throw new IllegalStateException("missing isolate unit " + key);
+      if (!unit.routeIds.contains(route.routeId)) {
+        throw new IllegalStateException("worker unit " + key + " does not contain route " + route.routeId);
+      }
       return unit;
+    }
+
+    void validatePlacement() {
+      Set<String> knownRoutes = new java.util.HashSet<>();
+      for (RouteDef route : routes) knownRoutes.add(route.routeId);
+      for (String configuredRoute : placement.routeAssignments.keySet()) {
+        if (!knownRoutes.contains(configuredRoute)) {
+          throw new IllegalArgumentException("worker placement references unknown route_id " + configuredRoute);
+        }
+      }
+      Set<String> knownIdentities = new java.util.HashSet<>();
+      for (RouteDef route : routes) knownIdentities.add(route.verb + " " + route.path);
+      for (String configuredIdentity : placement.routeIdentityAssignments.keySet()) {
+        if (!knownIdentities.contains(configuredIdentity)) {
+          throw new IllegalArgumentException("worker placement references unknown route identity " + configuredIdentity);
+        }
+      }
+      for (RouteDef route : routes) {
+        String identity = route.verb + " " + route.path;
+        String byId = placement.routeAssignments.get(route.routeId);
+        String byIdentity = placement.routeIdentityAssignments.get(identity);
+        if (byId != null && byIdentity != null && !byId.equals(byIdentity)) {
+          throw new IllegalArgumentException(
+            "worker placement has conflicting assignments for " + route.routeId + " / " + identity);
+        }
+
+        String key = placement.unitKey(route);
+        UnitDef unit = units.get(key);
+        if (unit == null) {
+          throw new IllegalArgumentException("worker placement selects missing generated unit " + key + " for " + route.routeId);
+        }
+        if (!unit.routeIds.contains(route.routeId)) {
+          throw new IllegalArgumentException("worker placement selects unit " + key + " that does not contain " + route.routeId);
+        }
+      }
     }
 
     void validateManifest(JsonNode manifest) {
@@ -475,7 +617,7 @@ public final class SupervisorMain {
       return List.copyOf(parsed);
     }
 
-    Map<String, UnitDef> parseUnits(JsonNode manifest, String selectedKind) {
+    Map<String, UnitDef> parseUnits(JsonNode manifest) {
       JsonNode unitNodes = manifest.path("isolate_units");
       if (!unitNodes.isArray() || unitNodes.isEmpty() || unitNodes.size() > MAX_UNITS) {
         throw new IllegalArgumentException("Graal manifest isolate-unit count is invalid");
@@ -484,7 +626,7 @@ public final class SupervisorMain {
       Map<String, UnitDef> parsed = new LinkedHashMap<>();
       for (JsonNode unit : unitNodes) {
         String kind = unit.path("kind").asText();
-        if (!selectedKind.equals(kind)) continue;
+        if (kind.isBlank()) throw new IllegalArgumentException("isolate unit kind is required");
         String key = unit.path("key").asText();
         String group = unit.path("group").asText();
         List<String> ids = new ArrayList<>();
@@ -493,8 +635,8 @@ public final class SupervisorMain {
         if (!sources.isArray() || sources.size() != 2 || !sharedSource.equals(sources.get(0).asText())) {
           throw new IllegalArgumentException("isolate unit must contain the declared common + unit source: " + key);
         }
-        if (key.isBlank() || key.length() > MAX_IDENTIFIER + 16
-            || group.isBlank() || group.length() > MAX_IDENTIFIER
+        if (key.isBlank() || key.length() > MAX_IDENTIFIER + 32
+            || group.length() > MAX_IDENTIFIER
             || ids.isEmpty() || ids.size() > MAX_ROUTES || parsed.containsKey(key)) {
           throw new IllegalArgumentException("invalid or duplicate isolate unit: " + key);
         }
@@ -510,11 +652,10 @@ public final class SupervisorMain {
         String source = readRubySource(unitPath, "Graal isolate unit " + key);
         parsed.put(key, new UnitDef(kind, key, group, ids, unitPath, source));
       }
-      validateUnitCoverage(parsed, selectedKind);
       return Map.copyOf(parsed);
     }
 
-    void validateUnitCoverage(Map<String, UnitDef> parsed, String selectedKind) {
+    void validateUnitDefinitions() {
       Map<String, RouteDef> byId = new HashMap<>();
       Map<String, List<RouteDef>> byGroup = new HashMap<>();
       for (RouteDef route : routes) {
@@ -522,33 +663,44 @@ public final class SupervisorMain {
         byGroup.computeIfAbsent(route.group, ignored -> new ArrayList<>()).add(route);
       }
 
-      Set<String> covered = new java.util.HashSet<>();
-      for (UnitDef unit : parsed.values()) {
-        if ("route".equals(selectedKind)) {
-          if (unit.routeIds.size() != 1) throw new IllegalArgumentException("route isolate must contain exactly one route: " + unit.key);
+      for (UnitDef unit : units.values()) {
+        Set<String> ids = new java.util.HashSet<>(unit.routeIds);
+        if (ids.size() != unit.routeIds.size()) {
+          throw new IllegalArgumentException("isolate unit contains duplicate route_ids: " + unit.key);
+        }
+        for (String id : ids) {
+          if (!byId.containsKey(id)) {
+            throw new IllegalArgumentException("isolate unit references unknown route_id " + id + ": " + unit.key);
+          }
+        }
+
+        if ("route".equals(unit.kind)) {
+          if (unit.group.isBlank()) {
+            throw new IllegalArgumentException("route isolate group is required: " + unit.key);
+          }
+          if (unit.routeIds.size() != 1) {
+            throw new IllegalArgumentException("route isolate must contain exactly one route: " + unit.key);
+          }
           RouteDef route = byId.get(unit.routeIds.get(0));
-          if (route == null || !unit.key.equals("route:" + route.routeId) || !unit.group.equals(route.group)) {
+          if (!unit.key.equals("route:" + route.routeId) || !unit.group.equals(route.group)) {
             throw new IllegalArgumentException("route isolate does not match route metadata: " + unit.key);
           }
-          if (!covered.add(route.routeId)) throw new IllegalArgumentException("route is covered by multiple isolate units: " + route.routeId);
-        } else {
+        } else if ("group".equals(unit.kind)) {
+          if (unit.group.isBlank()) {
+            throw new IllegalArgumentException("group isolate group is required: " + unit.key);
+          }
           List<RouteDef> expected = byGroup.get(unit.group);
           if (expected == null || !unit.key.equals("group:" + unit.group)) {
             throw new IllegalArgumentException("group isolate does not match route metadata: " + unit.key);
           }
           Set<String> expectedIds = new java.util.HashSet<>();
           expected.forEach(route -> expectedIds.add(route.routeId));
-          Set<String> actualIds = new java.util.HashSet<>(unit.routeIds);
-          if (actualIds.size() != unit.routeIds.size() || !actualIds.equals(expectedIds)) {
+          if (!ids.equals(expectedIds)) {
             throw new IllegalArgumentException("group isolate route_ids do not exactly match group routes: " + unit.key);
           }
-          for (String routeId : actualIds) {
-            if (!covered.add(routeId)) throw new IllegalArgumentException("route is covered by multiple isolate units: " + routeId);
-          }
+        } else if (!unit.key.startsWith(unit.kind + ":")) {
+          throw new IllegalArgumentException("custom isolate unit key must be namespaced by kind: " + unit.key);
         }
-      }
-      if (covered.size() != routes.size()) {
-        throw new IllegalArgumentException("selected isolate units do not cover every route exactly once");
       }
     }
 
@@ -641,9 +793,15 @@ public final class SupervisorMain {
       for (UnitDef unit : settings.units.values()) {
         unitSources.put(unit.key, source(unit.unitSource, unit.unitPath.getFileName().toString() + "-" + safeName(unit.key)));
       }
-      // Isolates are created lazily on first matching request. This avoids
-      // eagerly booting one TruffleRuby Context for every route/group and keeps
-      // idle units at zero cost until they receive traffic.
+      if (settings.placement.eager()) {
+        for (String key : settings.selectedUnitKeys()) {
+          UnitDef unit = settings.units.get(key);
+          if (unit == null) throw new IllegalStateException("missing eager worker unit " + key);
+          cells.put(key, create(unit));
+        }
+      }
+      // Lazy mode creates a worker only on the first request that selects its
+      // configured unit. Eager mode prewarms every distinct selected unit.
       maintenance.scheduleAtFixedRate(this::maintainSafe, 1, 1, TimeUnit.SECONDS);
     }
 
@@ -776,6 +934,18 @@ public final class SupervisorMain {
     }
   }
 
+  /**
+   * One long-lived TruffleRuby runtime/isolation cell.
+   *
+   * A GraalWorker is not inherently a Lambda handler and is not required to be
+   * 1:1 with a route. Worker placement is selected separately by Settings:
+   * the safe default is one worker per generated route unit, while compatible
+   * generated units may be shared by multiple routes.
+   *
+   * Future generated units such as domain:public, domain:private, and
+   * domain:admin can use the same placement mechanism without changing this
+   * lifecycle abstraction.
+   */
   static final class GraalWorker implements AutoCloseable {
     record RuntimeState(Context context, Value invoke) {}
 

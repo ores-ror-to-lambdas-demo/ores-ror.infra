@@ -81,6 +81,73 @@ final class ClusterSmokeTest {
   }
 
   @Test
+  void mixedWorkerPlacementSharesOnlyExplicitlyCompatibleRoutes() throws Exception {
+    Path root = Path.of(System.getProperty("app.root")).toAbsolutePath().normalize();
+    var placement = new SupervisorMain.WorkerPlacement(
+      "route",
+      "lazy",
+      java.util.Map.of(),
+      java.util.Map.of(
+        "GET /orders/:id", "group:orders",
+        "POST /orders/:id/cancel", "group:orders"
+      )
+    );
+    var settings = SupervisorMain.Settings.test(root, placement, 2);
+
+    try (var cluster = new SupervisorMain.Cluster(settings)) {
+      assertEquals(0, cluster.workerCount(), "lazy placement must not pre-create workers");
+
+      JsonNode show = cluster.invoke(request("mixed-show", "GET", "/orders/demo"));
+      JsonNode cancel = cluster.invoke(request("mixed-cancel", "POST", "/orders/demo/cancel"));
+      String showContext = show.path("headers").path("x-ores-graal-context-id").asText();
+      String cancelContext = cancel.path("headers").path("x-ores-graal-context-id").asText();
+      assertEquals(showContext, cancelContext, "explicitly assigned routes should share the selected generated worker unit");
+      assertEquals(1, cluster.workerCount());
+
+      JsonNode health = cluster.invoke(request("mixed-health", "GET", "/healthz"));
+      String healthContext = health.path("headers").path("x-ores-graal-context-id").asText();
+      assertNotEquals(showContext, healthContext, "unassigned routes keep the safe per-handler worker default");
+      assertEquals(2, cluster.workerCount());
+    }
+  }
+
+  @Test
+  void workerPlacementRejectsConflictingRouteSelectors() throws Exception {
+    Path root = Path.of(System.getProperty("app.root")).toAbsolutePath().normalize();
+    var probe = SupervisorMain.Settings.test(root, "route", 1);
+    var health = probe.resolveRoute("GET", "/healthz");
+    assertTrue(health != null);
+
+    var placement = new SupervisorMain.WorkerPlacement(
+      "route",
+      "lazy",
+      java.util.Map.of(health.routeId, "route:" + health.routeId),
+      java.util.Map.of("GET /healthz", "group:healthz")
+    );
+
+    assertThrows(
+      IllegalArgumentException.class,
+      () -> SupervisorMain.Settings.test(root, placement, 1)
+    );
+  }
+
+  @Test
+  void workerPlacementRejectsUnitsThatDoNotContainTheSelectedRoute() throws Exception {
+    Path root = Path.of(System.getProperty("app.root")).toAbsolutePath().normalize();
+    var placement = new SupervisorMain.WorkerPlacement(
+      "route",
+      "lazy",
+      java.util.Map.of(),
+      java.util.Map.of("GET /healthz", "group:orders")
+    );
+
+    assertThrows(
+      IllegalArgumentException.class,
+      () -> SupervisorMain.Settings.test(root, placement, 1)
+    );
+  }
+
+  @Test
   void routeAndGroupGranularityHaveExpectedIsolationBoundaries() throws Exception {
     Path root = Path.of(System.getProperty("app.root")).toAbsolutePath().normalize();
 
@@ -211,13 +278,13 @@ final class ClusterSmokeTest {
 
     ObjectNode wrongUnitPool = manifest.deepCopy();
     ((ObjectNode) wrongUnitPool.withArray("isolate_units").get(0)).put("host_thread_pool_size", 4);
-    assertThrows(IllegalArgumentException.class, () -> settings.parseUnits(wrongUnitPool, "route"));
+    assertThrows(IllegalArgumentException.class, () -> settings.parseUnits(wrongUnitPool));
 
     ObjectNode wrongSharedSource = manifest.deepCopy();
     ObjectNode firstUnit = (ObjectNode) wrongSharedSource.withArray("isolate_units").get(0);
     firstUnit.withArray("sources").set(
       0, SupervisorMain.JSON.getNodeFactory().textNode("generated/graal/not-common.rb"));
-    assertThrows(IllegalArgumentException.class, () -> settings.parseUnits(wrongSharedSource, "route"));
+    assertThrows(IllegalArgumentException.class, () -> settings.parseUnits(wrongSharedSource));
 
     ObjectNode duplicateRouteId = manifest.deepCopy();
     String firstId = duplicateRouteId.withArray("routes").get(0).path("route_id").asText();
