@@ -22,4 +22,11 @@ test -f "$APP_ROOT/.ores-generated/graal/groups/orders/handler.rb"
 test -f "$APP_ROOT/.ores-generated/graal/routes/users/[id]/_get/handler.rb"
 ! grep -R -E 'config/environment|Rails\.application|ActionController|ActionView' "$APP_ROOT/.ores-generated/graal"
 ! grep -R -F 'require "json"' "$APP_ROOT/.ores-generated/graal"
+! grep -R -F 'require "erb"' "$APP_ROOT/.ores-generated/graal"
+! grep -R -F 'ERB.new' "$APP_ROOT/.ores-generated/graal"
+grep -Fq '"host_thread_pool_size_per_context": 5' "$APP_ROOT/.ores-generated/graal/manifest.json"
+test -f "$APP_ROOT/app/controllers/users/show/handler.rb"
+git -C "$APP_ROOT" check-ignore -q app/controllers/users/show/handler.rb
+test -z "$(git -C "$APP_ROOT" ls-files ':(glob)app/controllers/**/handler.rb')"
+test ! -d "$APP_ROOT/routes"
 mvn -f "$ROOT/pom.xml" -DskipTests package
