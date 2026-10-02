@@ -50,7 +50,8 @@ jobs:
           test -f generated/graal/manifest.json
           test -f generated/graal/routes/users/'[id]'/_get/handler.rb
           grep -Fq '# --- infra graal/bootstrap.rb ---' generated/graal/routes/users/'[id]'/_get/handler.rb
-          ! grep -R -E 'config/environment|Rails\.application' generated/graal
+          ! grep -R -E 'config/environment|Rails\.application|ActionController|ActionView' generated/graal
+          ! grep -R -F 'require "json"' generated/graal
 
       - name: Re-run full Rails-vs-Graal route and middleware parity
         working-directory: app
@@ -145,6 +146,7 @@ jobs:
           grep -Fq '"max_admitted_in_flight_per_isolate": 5' app/generated/graal/manifest.json
           grep -Fq '"engine_scope": "process-shared"' app/generated/graal/manifest.json
           ! grep -R -E 'config/environment|Rails\.application|ActionController|ActionView' app/generated/graal
+          ! grep -R -F 'require "json"' app/generated/graal
       - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
           distribution: graalvm
