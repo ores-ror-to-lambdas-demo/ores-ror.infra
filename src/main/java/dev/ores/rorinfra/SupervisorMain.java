@@ -731,6 +731,7 @@ public final class SupervisorMain {
         .allowExperimentalOptions(true)
         .option("ruby.platform-native", "false")
         .option("ruby.cexts", "false")
+        .option("ruby.rubygems", "false")
         .allowAllAccess(false)
         .allowHostAccess(HostAccess.EXPLICIT)
         .allowHostClassLookup(name -> false)
