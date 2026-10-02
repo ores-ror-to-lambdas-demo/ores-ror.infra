@@ -691,6 +691,11 @@ public final class SupervisorMain {
         state = owner.submit(() -> {
           Context created = newContext(engine);
           try {
+            // The generated entrypoint uses JSON.parse/generate but intentionally
+            // contains no runtime require directives. A fresh embedded TruffleRuby
+            // Context does not preload JSON, so establish that stdlib dependency
+            // once at Context creation before evaluating generated application code.
+            created.eval("ruby", "require 'json'");
             created.eval(commonSource);
             Value factory = created.eval(unitSource);
             if (!factory.canExecute()) {
