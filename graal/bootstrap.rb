@@ -2,8 +2,8 @@
 # Appended to every generated Graal route/group unit.
 # common.rb and this unit source are each evaluated exactly once in a long-lived Context.
 
-if defined?(ores_gs_http) && !defined?(ORES_GS_HTTP)
-  ORES_GS_HTTP = ores_gs_http
+if defined?(ores_gs_http)
+  OresApp::GraalCapabilities.http = ores_gs_http
 end
 
 module OresGenerated
@@ -19,7 +19,7 @@ module OresGenerated
 end
 
 def ores_graal_invoke(request_json)
-  raise "Graal host HTTP capability is unavailable" unless defined?(ORES_GS_HTTP)
+  raise "Graal host HTTP capability is unavailable" unless OresApp::GraalCapabilities.http
 
   request = JSON.parse(request_json.to_s)
   JSON.generate(OresGenerated::GraalEntrypoint.call(request))
@@ -31,8 +31,7 @@ request_invoker = method(:ores_graal_invoke)
   if args.length == 1 && args.first.is_a?(String)
     request_invoker.call(args.first)
   else
-    http_capability = args.fetch(0)
-    Object.const_set(:ORES_GS_HTTP, http_capability) unless defined?(ORES_GS_HTTP)
+    OresApp::GraalCapabilities.http ||= args.fetch(0)
     request_invoker
   end
 end
