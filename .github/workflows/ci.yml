@@ -17,7 +17,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: ores-ror-to-lambdas-demo/ores-ror.rb
-          ref: refactor/runtime-assets-to-infra
+          ref: main
           path: app
       - uses: ruby/setup-ruby@v1
         with:
