@@ -7,8 +7,8 @@ ARG TRUFFLERUBY_VERSION=34.0.1
 
 RUN microdnf install -y \
       ca-certificates curl gzip tar xz \
-      gcc gcc-c++ make pkgconf-pkg-config \
-      openssl-devel libffi-devel \
+      gcc gcc-c++ make pkgconf-pkg-config patch \
+      openssl-devel libffi-devel zlib-devel libxml2-devel libxslt-devel \
     && microdnf clean all
 
 RUN set -eux; \
@@ -37,7 +37,8 @@ ENV BUNDLE_PATH=/opt/ores-ror-bundle \
     ORES_LAMBDA_HANDLER_GRANULARITY=route
 
 COPY Gemfile ./Gemfile
-RUN bundle install --jobs 4 --retry 3 \
+RUN bundle config set build.nokogiri --use-system-libraries \
+    && bundle install --jobs 4 --retry 3 \
     && truffleruby -e 'abort "rails gem present" unless Gem::Specification.find_all_by_name("rails").empty?' \
     && bundle exec truffleruby -e 'require "connection_pool"; require "base64"'
 
