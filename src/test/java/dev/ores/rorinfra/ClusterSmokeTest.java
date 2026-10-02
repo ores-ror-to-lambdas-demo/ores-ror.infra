@@ -112,6 +112,26 @@ final class ClusterSmokeTest {
   }
 
   @Test
+  void workerPlacementRejectsConflictingRouteSelectors() throws Exception {
+    Path root = Path.of(System.getProperty("app.root")).toAbsolutePath().normalize();
+    var probe = SupervisorMain.Settings.test(root, "route", 1);
+    var health = probe.resolveRoute("GET", "/healthz");
+    assertTrue(health != null);
+
+    var placement = new SupervisorMain.WorkerPlacement(
+      "route",
+      "lazy",
+      java.util.Map.of(health.routeId, "route:" + health.routeId),
+      java.util.Map.of("GET /healthz", "group:healthz")
+    );
+
+    assertThrows(
+      IllegalArgumentException.class,
+      () -> SupervisorMain.Settings.test(root, placement, 1)
+    );
+  }
+
+  @Test
   void workerPlacementRejectsUnitsThatDoNotContainTheSelectedRoute() throws Exception {
     Path root = Path.of(System.getProperty("app.root")).toAbsolutePath().normalize();
     var placement = new SupervisorMain.WorkerPlacement(
