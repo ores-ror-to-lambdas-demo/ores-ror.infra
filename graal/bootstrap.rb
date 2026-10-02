@@ -2,9 +2,26 @@
 # Appended to every generated Graal route/group unit.
 # common.rb and this unit source are each evaluated exactly once in a long-lived Context.
 
+module OresApp
+  module GraalCapabilities
+    class << self
+      attr_accessor :http
+    end
+  end
+end
+
 if defined?(ores_gs_http)
   OresApp::GraalCapabilities.http = ores_gs_http
 end
+
+# Compatibility shim for app revisions that still call the historical constant.
+# It delegates to the explicit capability slot and performs no reflective constant mutation.
+ORES_GS_HTTP = lambda do |*args|
+  bridge = OresApp::GraalCapabilities.http
+  raise "Graal host HTTP capability is unavailable" unless bridge
+
+  bridge.call(*args)
+end unless defined?(ORES_GS_HTTP)
 
 module OresGenerated
   module GraalEntrypoint
