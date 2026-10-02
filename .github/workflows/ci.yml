@@ -137,9 +137,12 @@ jobs:
         run: ruby bin/build-runtime
       - name: Assert one-context-per-isolate manifest
         run: |
+          grep -Fq '"schema": "ores-graal-ruby-manifest/v4"' app/generated/graal/manifest.json
           grep -Fq '"context_model": "one-long-lived-context-per-route-or-group-isolate"' app/generated/graal/manifest.json
           grep -Fq '"contexts_per_isolate": 1' app/generated/graal/manifest.json
-          grep -Fq '"max_concurrency_per_isolate": 5' app/generated/graal/manifest.json
+          grep -Fq '"guest_owner_threads_per_context": 1' app/generated/graal/manifest.json
+          grep -Fq '"execution_concurrency_per_context": 1' app/generated/graal/manifest.json
+          grep -Fq '"max_admitted_in_flight_per_isolate": 5' app/generated/graal/manifest.json
           grep -Fq '"engine_scope": "process-shared"' app/generated/graal/manifest.json
           ! grep -R -E 'config/environment|Rails\.application|ActionController|ActionView' app/generated/graal
       - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
