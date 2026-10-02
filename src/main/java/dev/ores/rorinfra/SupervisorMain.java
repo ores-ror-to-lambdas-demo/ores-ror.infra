@@ -627,8 +627,8 @@ public final class SupervisorMain {
         if (!sources.isArray() || sources.size() != 2 || !sharedSource.equals(sources.get(0).asText())) {
           throw new IllegalArgumentException("isolate unit must contain the declared common + unit source: " + key);
         }
-        if (key.isBlank() || key.length() > MAX_IDENTIFIER + 16
-            || group.isBlank() || group.length() > MAX_IDENTIFIER
+        if (key.isBlank() || key.length() > MAX_IDENTIFIER + 32
+            || group.length() > MAX_IDENTIFIER
             || ids.isEmpty() || ids.size() > MAX_ROUTES || parsed.containsKey(key)) {
           throw new IllegalArgumentException("invalid or duplicate isolate unit: " + key);
         }
@@ -667,6 +667,9 @@ public final class SupervisorMain {
         }
 
         if ("route".equals(unit.kind)) {
+          if (unit.group.isBlank()) {
+            throw new IllegalArgumentException("route isolate group is required: " + unit.key);
+          }
           if (unit.routeIds.size() != 1) {
             throw new IllegalArgumentException("route isolate must contain exactly one route: " + unit.key);
           }
@@ -675,6 +678,9 @@ public final class SupervisorMain {
             throw new IllegalArgumentException("route isolate does not match route metadata: " + unit.key);
           }
         } else if ("group".equals(unit.kind)) {
+          if (unit.group.isBlank()) {
+            throw new IllegalArgumentException("group isolate group is required: " + unit.key);
+          }
           List<RouteDef> expected = byGroup.get(unit.group);
           if (expected == null || !unit.key.equals("group:" + unit.group)) {
             throw new IllegalArgumentException("group isolate does not match route metadata: " + unit.key);
