@@ -292,7 +292,7 @@ public final class SupervisorMain {
         env("ISOLATION_GRANULARITY", "route").toLowerCase(),
         env("DATA_API_URL", "http://127.0.0.1:8787/v1"),
         env("DATA_API_TOKEN", ""),
-        integerAlias("CONTEXT_MAX_CONCURRENCY", "ISOLATE_MAX_CONCURRENCY", 5, 1, 5),
+        integerAliases("CONTEXT_ADMISSION_LIMIT", List.of("CONTEXT_MAX_CONCURRENCY", "ISOLATE_MAX_CONCURRENCY"), 5, 1, 5),
         1000L * integerAlias("CONTEXT_MAX_AGE_SECONDS", "ISOLATE_MAX_AGE_SECONDS", 1800, 60, 1800),
         1000L * integerAlias("CONTEXT_IDLE_SECONDS", "ISOLATE_IDLE_SECONDS", 300, 30, 300),
         1000L * integerAlias("CONTEXT_DRAIN_SECONDS", "ISOLATE_DRAIN_SECONDS", 30, 1, 300),
@@ -460,8 +460,17 @@ public final class SupervisorMain {
     }
 
     static int integerAlias(String preferred, String legacy, int defaultValue, int min, int max) {
+      return integerAliases(preferred, List.of(legacy), defaultValue, min, max);
+    }
+
+    static int integerAliases(String preferred, List<String> legacyNames, int defaultValue, int min, int max) {
       String value = System.getenv(preferred);
-      if (value == null || value.isBlank()) value = System.getenv(legacy);
+      if (value == null || value.isBlank()) {
+        for (String legacy : legacyNames) {
+          value = System.getenv(legacy);
+          if (value != null && !value.isBlank()) break;
+        }
+      }
       if (value == null || value.isBlank()) return defaultValue;
       int parsed = Integer.parseInt(value);
       if (parsed < min || parsed > max) throw new IllegalArgumentException(preferred + " out of range");
