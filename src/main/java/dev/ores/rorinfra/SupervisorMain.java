@@ -29,13 +29,13 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.locks.ReentrantLock;
 import java.util.regex.Pattern;
 import org.graalvm.polyglot.Context;
 import org.graalvm.polyglot.Engine;
@@ -68,7 +68,7 @@ public final class SupervisorMain {
       }, "ror-shutdown"));
       server.start();
       System.out.printf(
-        "TruffleRuby/Graal listening on http://%s:%d granularity=%s isolates=%d contexts/isolate=1 threads/context=%d shared-engine=1%n",
+        "TruffleRuby/Graal listening on http://%s:%d granularity=%s isolates=%d contexts/isolate=1 guest-owner-threads/context=1 admission-limit/context=%d shared-engine=1%n",
         settings.bindHost,
         settings.port,
         settings.granularity,
@@ -458,6 +458,10 @@ public final class SupervisorMain {
     }
 
     synchronized int workerCount() {
+      return cells.values().size();
+    }
+
+    synchronized int admissionCapacity() {
       return cells.values().stream().mapToInt(cell -> cell.settings.workersPerIsolate).sum();
     }
 
@@ -541,48 +545,78 @@ public final class SupervisorMain {
   }
 
   static final class GraalWorker implements AutoCloseable {
+    record RuntimeState(Context context, Value invoke) {}
+
     final String id;
     final String contextId;
     final UnitDef unit;
     final Settings settings;
+    final ThreadPoolExecutor owner;
+    final Semaphore admission;
     final Context context;
     final Value invoke;
-    final ThreadPoolExecutor pool;
     final long born = System.currentTimeMillis();
     final AtomicLong last = new AtomicLong(born);
     final AtomicLong retiredAt = new AtomicLong(Long.MAX_VALUE);
     final AtomicInteger active = new AtomicInteger();
     final AtomicInteger guestEntries = new AtomicInteger();
     final AtomicInteger maxGuestEntries = new AtomicInteger();
-    final ReentrantLock contextEntry = new ReentrantLock(true);
     volatile boolean open = true;
     volatile boolean closed;
 
-    GraalWorker(String id, UnitDef unit, Settings settings, Engine engine, Source commonSource, Source unitSource, HttpBridge http) throws Exception {
+    GraalWorker(
+      String id,
+      UnitDef unit,
+      Settings settings,
+      Engine engine,
+      Source commonSource,
+      Source unitSource,
+      HttpBridge http
+    ) throws Exception {
       this.id = id;
       this.contextId = id + "-context";
       this.unit = unit;
       this.settings = settings;
-      this.context = newContext(engine);
-      try {
-        context.eval(commonSource);
-        Value factory = context.eval(unitSource);
-        if (!factory.canExecute()) throw new IllegalStateException("Graal isolate unit did not return an executable factory: " + unit.key);
-        this.invoke = factory.execute((ProxyExecutable) http::call);
-        if (!invoke.canExecute()) throw new IllegalStateException("Graal isolate unit factory did not return an executable invoker: " + unit.key);
-      } catch (Throwable error) {
-        context.close(true);
-        throw error;
-      }
-
-      this.pool = new ThreadPoolExecutor(
-        settings.workersPerIsolate,
-        settings.workersPerIsolate,
+      this.admission = new Semaphore(settings.workersPerIsolate, true);
+      this.owner = new ThreadPoolExecutor(
+        1,
+        1,
         0,
         TimeUnit.MILLISECONDS,
-        new ArrayBlockingQueue<>(settings.workersPerIsolate * 8),
-        named(safeName(unit.key) + "-worker"),
+        new ArrayBlockingQueue<>(Math.max(8, settings.workersPerIsolate * 4)),
+        named(safeName(unit.key) + "-guest-owner"),
         new ThreadPoolExecutor.AbortPolicy());
+
+      RuntimeState state;
+      try {
+        state = owner.submit(() -> {
+          Context created = newContext(engine);
+          try {
+            created.eval(commonSource);
+            Value factory = created.eval(unitSource);
+            if (!factory.canExecute()) {
+              throw new IllegalStateException("Graal isolate unit did not return an executable factory: " + unit.key);
+            }
+            Value bound = factory.execute((ProxyExecutable) http::call);
+            if (!bound.canExecute()) {
+              throw new IllegalStateException("Graal isolate unit factory did not return an executable invoker: " + unit.key);
+            }
+            return new RuntimeState(created, bound);
+          } catch (Throwable error) {
+            try {
+              created.close(true);
+            } catch (Throwable ignored) {
+              // initialization already failed
+            }
+            throw error;
+          }
+        }).get();
+      } catch (Throwable error) {
+        owner.shutdownNow();
+        throw error;
+      }
+      this.context = state.context();
+      this.invoke = state.invoke();
     }
 
     static Context newContext(Engine engine) {
@@ -605,30 +639,38 @@ public final class SupervisorMain {
 
     CompletableFuture<JsonNode> submit(ObjectNode request) {
       if (!accepting()) throw new RejectedExecutionException("isolate retiring");
+      if (!admission.tryAcquire()) throw new RejectedExecutionException("isolate admission limit reached");
       last.set(System.currentTimeMillis());
+      active.incrementAndGet();
+
       CompletableFuture<JsonNode> future = new CompletableFuture<>();
-      pool.execute(() -> {
-        active.incrementAndGet();
-        contextEntry.lock();
-        try {
+      try {
+        owner.execute(() -> {
           int entries = guestEntries.incrementAndGet();
           maxGuestEntries.accumulateAndGet(entries, Math::max);
           try {
             Value value = invoke.execute(JSON.writeValueAsString(request));
             JsonNode response = JSON.readTree(value.asString());
             future.complete(withDiagnostics(response));
+          } catch (Throwable error) {
+            future.completeExceptionally(error);
           } finally {
             guestEntries.decrementAndGet();
+            active.decrementAndGet();
+            admission.release();
+            last.set(System.currentTimeMillis());
           }
-        } catch (Throwable error) {
-          future.completeExceptionally(error);
-        } finally {
-          contextEntry.unlock();
-          active.decrementAndGet();
-          last.set(System.currentTimeMillis());
-        }
-      });
+        });
+      } catch (RuntimeException error) {
+        active.decrementAndGet();
+        admission.release();
+        throw error;
+      }
       return future;
+    }
+
+    String evalForTest(String ruby) throws Exception {
+      return owner.submit(() -> context.eval("ruby", ruby).asString()).get();
     }
 
     JsonNode withDiagnostics(JsonNode response) {
@@ -647,7 +689,7 @@ public final class SupervisorMain {
     }
 
     int load() {
-      return active.get() + pool.getQueue().size();
+      return active.get();
     }
 
     int maxConcurrentGuestEntries() {
@@ -674,13 +716,12 @@ public final class SupervisorMain {
       if (!open || closed) return;
       open = false;
       retiredAt.set(System.currentTimeMillis());
-      pool.shutdown();
     }
 
     synchronized void hardCancel(String reason) {
       if (closed) return;
       open = false;
-      pool.shutdownNow();
+      owner.shutdownNow();
       try {
         context.close(true);
       } catch (Throwable error) {
@@ -692,32 +733,37 @@ public final class SupervisorMain {
     void closeAfterDrain() {
       if (closed) return;
       open = false;
-      pool.shutdown();
-      try {
-        if (!pool.awaitTermination(settings.drainMs, TimeUnit.MILLISECONDS)) {
-          hardCancel("drain timeout");
+      long deadline = System.currentTimeMillis() + settings.drainMs;
+      while (load() != 0 && System.currentTimeMillis() < deadline) {
+        try {
+          Thread.sleep(10);
+        } catch (InterruptedException error) {
+          Thread.currentThread().interrupt();
           return;
         }
-      } catch (InterruptedException error) {
-        Thread.currentThread().interrupt();
-        hardCancel("drain interrupted");
+      }
+      if (load() != 0) {
+        hardCancel("drain timeout");
         return;
       }
-      closeResources();
+      close();
     }
 
     @Override
-    public void close() {
+    public synchronized void close() {
       if (closed) return;
       open = false;
-      pool.shutdown();
       if (load() != 0) throw new IllegalStateException("isolate busy: " + unit.key);
-      closeResources();
-    }
-
-    synchronized void closeResources() {
-      if (closed) return;
-      context.close();
+      try {
+        owner.submit(() -> {
+          context.close();
+          return null;
+        }).get();
+      } catch (Exception error) {
+        throw new IllegalStateException("failed to close isolate " + unit.key, error);
+      } finally {
+        owner.shutdown();
+      }
       closed = true;
     }
   }
