@@ -44,6 +44,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Pattern;
 import org.graalvm.polyglot.Context;
 import org.graalvm.polyglot.Engine;
@@ -851,7 +852,11 @@ public final class SupervisorMain {
         return future.get(settings.requestTimeoutMs, TimeUnit.MILLISECONDS);
       } catch (TimeoutException timeout) {
         synchronized (this) {
-          hardReplace(cell, "request timeout");
+          try {
+            hardReplace(cell, "request timeout");
+          } catch (Exception replacementFailure) {
+            System.err.println("failed to replace timed-out " + cell.unit.key + ": " + safe(replacementFailure));
+          }
         }
         throw timeout;
       }
@@ -1019,8 +1024,10 @@ public final class SupervisorMain {
       this.admission = new Semaphore(settings.isolateMaxConcurrency, true);
 
       RuntimeState state;
+      AtomicReference<Context> initializingContext = new AtomicReference<>();
       var initialization = executionPool.submit(() -> {
         Context created = newContext(engine);
+        initializingContext.set(created);
         try {
           created.eval(commonSource);
           Value factory = created.eval(unitSource);
@@ -1044,6 +1051,14 @@ public final class SupervisorMain {
       try {
         state = initialization.get(settings.requestTimeoutMs, TimeUnit.MILLISECONDS);
       } catch (TimeoutException error) {
+        Context created = initializingContext.get();
+        if (created != null) {
+          try {
+            created.close(true);
+          } catch (Throwable ignored) {
+            // preserve the initialization timeout as the primary failure
+          }
+        }
         initialization.cancel(true);
         throw new IllegalStateException("timed out initializing isolate " + unit.key, error);
       } catch (Throwable error) {
