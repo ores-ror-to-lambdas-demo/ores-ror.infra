@@ -132,6 +132,25 @@ final class ClusterSmokeTest {
   }
 
   @Test
+  void closedClusterRejectsNewInvocationsAndDoesNotRecreateWorkers() throws Exception {
+    Path root = Path.of(System.getProperty("app.root")).toAbsolutePath().normalize();
+    var settings = SupervisorMain.Settings.test(root, "route", 1);
+    var cluster = new SupervisorMain.Cluster(settings);
+
+    JsonNode first = cluster.invoke(request("before-close", "GET", "/healthz"));
+    assertEquals(200, first.path("status").asInt());
+    assertEquals(1, cluster.workerCount());
+
+    cluster.close();
+    assertEquals(0, cluster.workerCount());
+    assertThrows(
+      RejectedExecutionException.class,
+      () -> cluster.invoke(request("after-close", "GET", "/healthz"))
+    );
+    assertEquals(0, cluster.workerCount(), "closed cluster must not lazily recreate a worker");
+  }
+
+  @Test
   void hardCancellingOneWorkerDoesNotShutdownSharedPoolOrOtherWorkers() throws Exception {
     Path root = Path.of(System.getProperty("app.root")).toAbsolutePath().normalize();
     var placement = new SupervisorMain.WorkerPlacement("route", "lazy", java.util.Map.of(), java.util.Map.of());
@@ -210,6 +229,26 @@ final class ClusterSmokeTest {
       assertNotEquals(showContext, healthContext, "unassigned routes keep the safe per-handler worker default");
       assertEquals(2, cluster.workerCount());
     }
+  }
+
+  @Test
+  void workerPlacementRejectsConflictingRouteSelectors() throws Exception {
+    Path root = Path.of(System.getProperty("app.root")).toAbsolutePath().normalize();
+    var probe = SupervisorMain.Settings.test(root, "route", 1);
+    var health = probe.resolveRoute("GET", "/healthz");
+    assertTrue(health != null);
+
+    var placement = new SupervisorMain.WorkerPlacement(
+      "route",
+      "lazy",
+      java.util.Map.of(health.routeId, "route:" + health.routeId),
+      java.util.Map.of("GET /healthz", "group:healthz")
+    );
+
+    assertThrows(
+      IllegalArgumentException.class,
+      () -> SupervisorMain.Settings.test(root, placement, 1)
+    );
   }
 
   @Test
