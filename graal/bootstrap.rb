@@ -38,8 +38,8 @@ end
 def ores_graal_invoke(request_json)
   raise "Graal host HTTP capability is unavailable" unless OresApp::GraalCapabilities.http
 
-  request = JSON.parse(request_json.to_s)
-  JSON.generate(OresGenerated::GraalEntrypoint.call(request))
+  request = OresApp::JsonCodec.parse(request_json.to_s)
+  OresApp::JsonCodec.generate(OresGenerated::GraalEntrypoint.call(request))
 end
 
 request_invoker = method(:ores_graal_invoke)
