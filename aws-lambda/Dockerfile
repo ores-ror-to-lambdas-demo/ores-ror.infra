@@ -7,8 +7,8 @@ ARG TRUFFLERUBY_VERSION=34.0.1
 
 RUN microdnf install -y \
       ca-certificates curl gzip tar xz \
-      gcc gcc-c++ make pkgconf-pkg-config patch \
-      openssl-devel libffi-devel zlib-devel libxml2-devel libxslt-devel \
+      gcc gcc-c++ make pkgconf-pkg-config \
+      openssl-devel libffi-devel \
     && microdnf clean all
 
 RUN set -eux; \
@@ -25,37 +25,48 @@ RUN set -eux; \
     rm -f /tmp/truffleruby.tar.gz; \
     /opt/truffleruby/lib/truffle/post_install_hook.sh
 
-ENV PATH=/opt/truffleruby/bin:${PATH}
-WORKDIR /var/task
+ENV PATH=/opt/truffleruby/bin:${PATH} \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8
 
-FROM truffleruby-base AS runtime
-
-ENV BUNDLE_PATH=/opt/ores-ror-bundle \
-    BUNDLE_GEMFILE=/var/task/Gemfile \
-    BUNDLE_WITHOUT=rails:test \
-    ORES_BUILD_TARGET=lambda \
+FROM truffleruby-base AS codegen
+ENV ORES_BUILD_TARGET=lambda \
     ORES_LAMBDA_HANDLER_GRANULARITY=route
-
-COPY Gemfile ./Gemfile
-RUN bundle config set build.nokogiri --use-system-libraries \
-    && bundle install --jobs 4 --retry 3 \
-    && truffleruby -e 'abort "rails gem present" unless Gem::Specification.find_all_by_name("rails").empty?' \
-    && bundle exec truffleruby -e 'require "connection_pool"; require "base64"'
-
-# The default build context is the application checkout. Runtime adapters are
-# supplied from the separately named BuildKit context:
-#   --build-context ores_infra=/path/to/ores-ror.infra
-COPY . /var/task
-COPY --from=ores_infra /aws-lambda/adapter.rb /var/task/aws-lambda/adapter.rb
-COPY --from=ores_infra /aws-lambda/runtime.rb /var/task/aws-lambda/runtime.rb
-COPY --from=ores_infra /aws-lambda/event-v2.json /var/task/aws-lambda/event-v2.json
-COPY --from=ores_infra /aws-lambda/bootstrap /var/task/aws-lambda/bootstrap
-
-RUN truffleruby bin/build-runtime \
+WORKDIR /src
+COPY . /src
+COPY --from=ores_infra /graal /ores-infra/graal
+RUN ORES_INFRA_ROOT=/ores-infra truffleruby -e 'abort "Rails unexpectedly loaded" if defined?(Rails)' \
+    && ORES_INFRA_ROOT=/ores-infra truffleruby bin/build-runtime \
     && test -f generated/lambda/manifest.json \
     && test -f generated/lambda/entrypoint.rb \
-    && test -f 'generated/lambda/routes/users/[id]/_get/handler.rb' \
-    && ! grep -R -E 'config/environment|Rails\.application' generated/lambda \
+    && test -f app/controllers/users/show/handler.rb \
+    && ! grep -R -E 'config/environment|Rails\.application|ActionController|ActionView' generated/lambda
+
+FROM truffleruby-base AS deps
+ENV BUNDLE_PATH=/opt/ores-ror-bundle \
+    BUNDLE_GEMFILE=/src/Gemfile
+WORKDIR /src
+COPY --from=ores_infra /aws-lambda/Gemfile.runtime ./Gemfile
+RUN bundle install --jobs 4 --retry 3 \
+    && bundle exec truffleruby -e 'require "connection_pool"; require "base64"; abort "Rails gem present" unless Gem::Specification.find_all_by_name("rails").empty?'
+
+FROM truffleruby-base AS runtime
+ENV BUNDLE_PATH=/opt/ores-ror-bundle \
+    BUNDLE_GEMFILE=/var/task/Gemfile \
+    ORES_BUILD_TARGET=lambda
+WORKDIR /var/task
+
+COPY --from=deps /opt/ores-ror-bundle /opt/ores-ror-bundle
+COPY --from=ores_infra /aws-lambda/Gemfile.runtime ./Gemfile
+COPY --from=codegen /src/generated/lambda ./generated/lambda
+COPY --from=ores_infra /aws-lambda/adapter.rb ./aws-lambda/adapter.rb
+COPY --from=ores_infra /aws-lambda/runtime.rb ./aws-lambda/runtime.rb
+COPY --from=ores_infra /aws-lambda/event-v2.json ./aws-lambda/event-v2.json
+COPY --from=ores_infra /aws-lambda/bootstrap ./aws-lambda/bootstrap
+
+RUN test ! -e config/environment.rb \
+    && test ! -d app/controllers \
+    && bundle exec truffleruby -e 'require "connection_pool"; require "base64"; abort "Rails gem present" unless Gem::Specification.find_all_by_name("rails").empty?' \
     && mkdir -p /var/runtime \
     && cp /var/task/aws-lambda/bootstrap /var/runtime/bootstrap \
     && chmod 0755 /var/runtime/bootstrap

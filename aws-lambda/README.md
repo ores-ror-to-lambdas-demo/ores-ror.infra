@@ -1,8 +1,8 @@
 # TruffleRuby on AWS Lambda
 
-This directory is owned by `ores-ror.infra`. The image consumes the `ores-ror.rb` application checkout as its primary Docker build context and these runtime adapters as a separate named BuildKit context.
+This directory is owned by `ores-ror.infra`. The Docker build consumes the `ores-ror.rb` checkout as a code-generation input and these runtime adapters as a separate named BuildKit context. The final runtime stage copies only generated Lambda artifacts plus the infra runtime files and a minimal Rails-free Gemfile.
 
-The Lambda target **does not boot Rails**. The application repo generates its route/group handlers from the same `config/routes.rb`, `routes/**`, `app/**`, and shared middleware contract used by normal Rails.
+The Lambda target **does not boot Rails**. The application repo derives route/group artifacts from `config/routes.rb`, normal Rails controller/model/view locations, and shared portable middleware. Controller-adjacent `handler.rb` files are generated and gitignored; there is no tracked parallel route-handler tree.
 
 Build locally from the infra checkout:
 
@@ -16,7 +16,7 @@ docker buildx build \
   "$APP_ROOT"
 ```
 
-The app checkout must not contain an `aws-lambda/` directory. `adapter.rb`, `runtime.rb`, `bootstrap`, the Dockerfile, and deployment scripts live here.
+The app checkout must not contain an `aws-lambda/` directory. `adapter.rb`, `runtime.rb`, `bootstrap`, the Dockerfile, the minimal runtime Gemfile, and deployment scripts live here. CI verifies the final image contains no Rails, Action Pack, or Action View gems and no Rails application source tree.
 
 ## Deploy
 

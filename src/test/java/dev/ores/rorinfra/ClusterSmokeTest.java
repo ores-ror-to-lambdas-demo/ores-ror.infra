@@ -9,6 +9,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import java.net.URI;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -23,7 +26,7 @@ final class ClusterSmokeTest {
   @Test
   void routeGranularityUsesOneLongLivedContextWithBoundedAdmission() throws Exception {
     Path root = Path.of(System.getProperty("app.root")).toAbsolutePath().normalize();
-    var settings = SupervisorMain.Settings.test(root, "route", 3);
+    var settings = SupervisorMain.Settings.test(root, "route", 5);
 
     try (var cluster = new SupervisorMain.Cluster(settings)) {
       assertEquals(0, cluster.contextCount());
@@ -45,13 +48,35 @@ final class ClusterSmokeTest {
       }
 
       assertEquals(1, contextIds.size(), "one route must keep one Context across request volume");
-      assertEquals(1, workerThreads.size(), "each Context must remain pinned to one guest-owner thread");
+      assertTrue(workerThreads.size() > 1, "one Context should be entered by multiple reusable host workers");
+      assertTrue(workerThreads.size() <= 5, "Context worker pool must remain bounded at five threads");
       assertEquals(1, cluster.contextCount(), "one requested route should own one long-lived Context");
       assertEquals(1, cluster.workerCount());
-      assertEquals(3, cluster.admissionCapacity());
+      assertEquals(5, cluster.admissionCapacity());
       var healthRoute = settings.resolveRoute("GET", "/healthz");
       var health = cluster.cells.get(settings.unitKey(healthRoute));
-      assertEquals(1, health.maxConcurrentGuestEntries(), "TruffleRuby Context entry must be serialized");
+      assertTrue(health.maxConcurrentGuestEntries() >= 1);
+      assertTrue(health.maxConcurrentGuestEntries() <= 5, "one Context must never exceed five concurrent guest entries");
+
+      ExecutorService parallel = Executors.newFixedThreadPool(5);
+      try {
+        Set<String> rubyThreadIds = ConcurrentHashMap.newKeySet();
+        List<CompletableFuture<Void>> entries = new ArrayList<>();
+        for (int i = 0; i < 5; i++) {
+          entries.add(CompletableFuture.runAsync(() -> {
+            try {
+              rubyThreadIds.add(health.evalForTest("sleep 0.05; Thread.current.object_id.to_s"));
+            } catch (Exception error) {
+              throw new RuntimeException(error);
+            }
+          }, parallel));
+        }
+        for (var entry : entries) entry.get();
+        assertTrue(rubyThreadIds.size() > 1, "shared Context must support entry from multiple host threads");
+        assertTrue(rubyThreadIds.size() <= 5);
+      } finally {
+        parallel.shutdownNow();
+      }
     }
   }
 
@@ -94,6 +119,14 @@ final class ClusterSmokeTest {
       String hostClass = worker.evalForTest("begin; Java.type('java.lang.System'); 'allowed'; rescue Exception => e; e.class.name; end"
       );
       assertNotEquals("allowed", hostClass, "host class lookup must remain blocked");
+
+      String fileRead = worker.evalForTest("begin; File.read('/etc/passwd'); 'allowed'; rescue Exception => e; e.class.name; end"
+      );
+      assertNotEquals("allowed", fileRead, "guest filesystem reads must remain blocked");
+
+      String process = worker.evalForTest("begin; Process.spawn('true'); 'allowed'; rescue Exception => e; e.class.name; end"
+      );
+      assertNotEquals("allowed", process, "guest process creation must remain blocked");
     }
   }
 
@@ -129,6 +162,10 @@ final class ClusterSmokeTest {
     );
     assertThrows(
       IllegalArgumentException.class,
+      () -> SupervisorMain.HttpBridge.targetUri(base, "GET", "/%252e%252e/admin", "")
+    );
+    assertThrows(
+      IllegalArgumentException.class,
       () -> SupervisorMain.HttpBridge.targetUri(base, "GET", "//evil.example/path", "")
     );
   }
@@ -149,6 +186,80 @@ final class ClusterSmokeTest {
     assertTrue(SupervisorMain.isLoopbackHost("127.0.0.1"));
     assertTrue(SupervisorMain.isLoopbackHost("::1"));
     assertFalse(SupervisorMain.isLoopbackHost("data.example.test"));
+  }
+
+  @Test
+  void strictUtf8DecoderRejectsMalformedInput() throws Exception {
+    assertEquals("hello ✓", SupervisorMain.decodeUtf8Strict("hello ✓".getBytes(StandardCharsets.UTF_8)));
+    assertThrows(CharacterCodingException.class, () -> SupervisorMain.decodeUtf8Strict(new byte[] {(byte) 0xC3, (byte) 0x28}));
+  }
+
+  @Test
+  void manifestIdentityAndUnitSourceContractFailClosed() throws Exception {
+    Path root = Path.of(System.getProperty("app.root")).toAbsolutePath().normalize();
+    var settings = SupervisorMain.Settings.test(root, "route", 2);
+    ObjectNode manifest = (ObjectNode) SupervisorMain.JSON.readTree(
+      Files.readString(root.resolve("generated/graal/manifest.json"), StandardCharsets.UTF_8));
+
+    ObjectNode wrongApplication = manifest.deepCopy();
+    wrongApplication.put("application", "other-app");
+    assertThrows(IllegalArgumentException.class, () -> settings.validateManifest(wrongApplication));
+
+    ObjectNode wrongPoolSize = manifest.deepCopy();
+    wrongPoolSize.put("host_thread_pool_size_per_context", 4);
+    assertThrows(IllegalArgumentException.class, () -> settings.validateManifest(wrongPoolSize));
+
+    ObjectNode wrongUnitPool = manifest.deepCopy();
+    ((ObjectNode) wrongUnitPool.withArray("isolate_units").get(0)).put("host_thread_pool_size", 4);
+    assertThrows(IllegalArgumentException.class, () -> settings.parseUnits(wrongUnitPool, "route"));
+
+    ObjectNode wrongSharedSource = manifest.deepCopy();
+    ObjectNode firstUnit = (ObjectNode) wrongSharedSource.withArray("isolate_units").get(0);
+    firstUnit.withArray("sources").set(
+      0, SupervisorMain.JSON.getNodeFactory().textNode("generated/graal/not-common.rb"));
+    assertThrows(IllegalArgumentException.class, () -> settings.parseUnits(wrongSharedSource, "route"));
+
+    ObjectNode duplicateRouteId = manifest.deepCopy();
+    String firstId = duplicateRouteId.withArray("routes").get(0).path("route_id").asText();
+    ((ObjectNode) duplicateRouteId.withArray("routes").get(1)).put("route_id", firstId);
+    assertThrows(IllegalArgumentException.class, () -> settings.parseRoutes(duplicateRouteId));
+  }
+
+  @Test
+  void guestResponseEnvelopeAndGeneratedSourceValidationFailClosed() throws Exception {
+    ObjectNode valid = SupervisorMain.JSON.createObjectNode();
+    valid.putObject("headers").put("content-type", "application/json");
+    valid.put("body", "{}");
+    SupervisorMain.GraalWorker.validateGuestResponse(valid);
+
+    ObjectNode missingBody = SupervisorMain.JSON.createObjectNode();
+    missingBody.putObject("headers");
+    assertThrows(IllegalStateException.class, () -> SupervisorMain.GraalWorker.validateGuestResponse(missingBody));
+
+    ObjectNode tooManyHeaders = SupervisorMain.JSON.createObjectNode();
+    ObjectNode headers = tooManyHeaders.putObject("headers");
+    for (int i = 0; i <= SupervisorMain.MAX_RESPONSE_HEADERS; i++) headers.put("x-test-" + i, "v");
+    tooManyHeaders.put("body", "{}");
+    assertThrows(IllegalStateException.class, () -> SupervisorMain.GraalWorker.validateGuestResponse(tooManyHeaders));
+
+    Path source = Files.createTempFile("ores-graal-source", ".rb");
+    try {
+      Files.writeString(source, "ActionController::Base\n", StandardCharsets.UTF_8);
+      assertThrows(
+        IllegalArgumentException.class,
+        () -> SupervisorMain.Settings.readRubySource(source, "adversarial generated source"));
+    } finally {
+      Files.deleteIfExists(source);
+    }
+  }
+
+  @Test
+  void hostHttpBridgeRejectsOversizedTargets() {
+    URI base = URI.create("https://data.example.test/v1/");
+    assertThrows(
+      IllegalArgumentException.class,
+      () -> SupervisorMain.HttpBridge.targetUri(base, "GET", "/" + "a".repeat(SupervisorMain.MAX_BRIDGE_URL), "")
+    );
   }
 
   static ObjectNode request(String id, String method, String path) {

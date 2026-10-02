@@ -20,7 +20,7 @@ jobs:
         with:
           persist-credentials: false
           repository: ores-ror-to-lambdas-demo/ores-ror.rb
-          ref: main
+          ref: e9d2dda847bccecd557a35231a91338fe18a79ef
           path: app
       - uses: ruby/setup-ruby@14594264cd68ce8a2345dd349bc3d138a4ef85c8
         with:
@@ -50,7 +50,8 @@ jobs:
           test -f generated/graal/manifest.json
           test -f generated/graal/routes/users/'[id]'/_get/handler.rb
           grep -Fq '# --- infra graal/bootstrap.rb ---' generated/graal/routes/users/'[id]'/_get/handler.rb
-          ! grep -R -E 'config/environment|Rails\.application' generated/graal
+          ! grep -R -E 'config/environment|Rails\.application|ActionController|ActionView' generated/graal
+          ! grep -R -F 'require "json"' generated/graal
 
       - name: Re-run full Rails-vs-Graal route and middleware parity
         working-directory: app
@@ -123,7 +124,7 @@ jobs:
         with:
           persist-credentials: false
           repository: ores-ror-to-lambdas-demo/ores-ror.rb
-          ref: main
+          ref: e9d2dda847bccecd557a35231a91338fe18a79ef
           path: app
       - uses: ruby/setup-ruby@14594264cd68ce8a2345dd349bc3d138a4ef85c8
         with:
@@ -140,17 +141,19 @@ jobs:
           grep -Fq '"schema": "ores-graal-ruby-manifest/v4"' app/generated/graal/manifest.json
           grep -Fq '"context_model": "one-long-lived-context-per-route-or-group-isolate"' app/generated/graal/manifest.json
           grep -Fq '"contexts_per_isolate": 1' app/generated/graal/manifest.json
-          grep -Fq '"guest_owner_threads_per_context": 1' app/generated/graal/manifest.json
-          grep -Fq '"execution_concurrency_per_context": 1' app/generated/graal/manifest.json
+          grep -Fq '"host_thread_pool_size_per_context": 5' app/generated/graal/manifest.json
+          grep -Fq '"guest_owner_threads_per_context": 5' app/generated/graal/manifest.json
+          grep -Fq '"execution_concurrency_per_context": 5' app/generated/graal/manifest.json
           grep -Fq '"max_admitted_in_flight_per_isolate": 5' app/generated/graal/manifest.json
           grep -Fq '"engine_scope": "process-shared"' app/generated/graal/manifest.json
           ! grep -R -E 'config/environment|Rails\.application|ActionController|ActionView' app/generated/graal
+          ! grep -R -F 'require "json"' app/generated/graal
       - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
           distribution: graalvm
           java-version: '21'
           cache: maven
-      - name: Prove GraalWorker route/group isolation and bounded host threads
+      - name: Prove GraalWorker route/group isolation and five-thread Context execution
         run: mvn -Dapp.root="$GITHUB_WORKSPACE/app" test
       - name: Package GraalWorker supervisor
         run: mvn -DskipTests package
