@@ -413,7 +413,8 @@ public final class SupervisorMain {
       if (manifest.path("contexts_per_isolate").asInt(0) != 1) {
         throw new IllegalArgumentException("Graal manifest must declare exactly one Context per isolate");
       }
-      if (manifest.path("guest_owner_threads_per_context").asInt(0) != 5
+      if (manifest.path("host_thread_pool_size_per_context").asInt(0) != 5
+          || manifest.path("guest_owner_threads_per_context").asInt(0) != 5
           || manifest.path("execution_concurrency_per_context").asInt(0) != 5) {
         throw new IllegalArgumentException("each Graal Context must declare a five-thread host executor");
       }
@@ -498,6 +499,7 @@ public final class SupervisorMain {
           throw new IllegalArgumentException("invalid or duplicate isolate unit: " + key);
         }
         if (unit.path("context_count").asInt(0) != 1
+            || unit.path("host_thread_pool_size").asInt(0) != 5
             || unit.path("guest_owner_threads").asInt(0) != 5
             || unit.path("execution_concurrency").asInt(0) != 5
             || unit.path("admission_limit").asInt(0) != 5
