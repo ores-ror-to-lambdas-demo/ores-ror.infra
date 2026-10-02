@@ -105,6 +105,42 @@ jobs:
       - name: Compile/package supervisor without the obsolete embedded-Rails smoke
         run: mvn -DskipTests package
 
+  graal-worker-cluster-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ores-ror-to-lambdas-demo/ores-ror.rb
+          ref: main
+          path: app
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+          bundler-cache: false
+      - name: Generate Rails-free route/group Graal units
+        working-directory: app
+        env:
+          ORES_BUILD_TARGET: graal
+          ORES_INFRA_ROOT: ${{ github.workspace }}
+        run: ruby bin/build-runtime
+      - name: Assert one-context-per-isolate manifest
+        run: |
+          grep -Fq '"context_model": "one-long-lived-context-per-route-or-group-isolate"' app/generated/graal/manifest.json
+          grep -Fq '"contexts_per_isolate": 1' app/generated/graal/manifest.json
+          grep -Fq '"max_concurrency_per_isolate": 5' app/generated/graal/manifest.json
+          grep -Fq '"engine_scope": "process-shared"' app/generated/graal/manifest.json
+          ! grep -R -E 'config/environment|Rails\.application|ActionController|ActionView' app/generated/graal
+      - uses: actions/setup-java@v4
+        with:
+          distribution: graalvm
+          java-version: '21'
+          cache: maven
+      - name: Prove GraalWorker route/group isolation and bounded host threads
+        run: mvn -Dapp.root="$GITHUB_WORKSPACE/app" test
+      - name: Package GraalWorker supervisor
+        run: mvn -DskipTests package
+
   ruby-native-isolate-upstream-capability:
     runs-on: ubuntu-latest
     steps:

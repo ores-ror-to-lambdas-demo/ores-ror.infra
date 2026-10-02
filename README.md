@@ -39,3 +39,17 @@ The Dockerfile lives here but uses the app checkout as its primary build context
 ## Invariant
 
 Moving hosting adapters here must not change routing or middleware behavior. Cross-repo CI checks all 15 application routes as JSON and HTML and preserves the exact Rails-vs-Graal contract diff.
+
+
+## GraalWorker topology
+
+The Java supervisor uses one process-wide shared Graal `Engine` for code/JIT caching and one long-lived `GraalWorker` per generated route or route-group isolate.
+
+Each `GraalWorker` owns:
+
+- exactly one long-lived TruffleRuby `Context`;
+- the cached generated common/unit sources for its route or group;
+- one bounded host-owned executor, capped at 5 threads;
+- explicit per-request envelopes; thread identity is diagnostic only.
+
+Many HTTP requests may enter the same long-lived Context through those reusable host threads. A request timeout hard-replaces only the affected isolate; max-age replacement creates replacement capacity before the old worker drains. Graal execution remains Rails-free: no `Rails.application`, Action Controller, or Action View is loaded in the guest runtime.
