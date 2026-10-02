@@ -584,6 +584,7 @@ public final class SupervisorMain {
       IOAccess io = IOAccess.newBuilder().allowHostFileAccess(false).allowHostSocketAccess(false).build();
       return Context.newBuilder("ruby")
         .engine(engine)
+        .allowExperimentalOptions(true)
         .option("ruby.platform-native", "false")
         .allowAllAccess(false)
         .allowHostAccess(HostAccess.EXPLICIT)
