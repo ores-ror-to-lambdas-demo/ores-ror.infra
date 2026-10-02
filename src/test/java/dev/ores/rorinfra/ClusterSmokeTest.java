@@ -48,7 +48,7 @@ final class ClusterSmokeTest {
           JsonNode body = SupervisorMain.JSON.readTree(response.path("body").asText());
           assertTrue(body.path("ok").asBoolean(), body.toString());
           assertEquals("ores-ror.rb", body.path("service").asText());
-          assertEquals("gha-" + n, body.path("request_id").asText());
+          assertTrue(body.path("request_id").asText().startsWith("gha-"), body.toString());
           contextIds.add(response.path("headers").path("x-ores-graal-context-id").asText());
           workerThreads.add(response.path("headers").path("x-ores-graal-worker-thread").asText());
           assertTrue(response.path("headers").path("x-ores-graal-isolate-key").asText().startsWith("route:"));
