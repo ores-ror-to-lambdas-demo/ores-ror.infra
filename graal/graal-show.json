@@ -31,9 +31,11 @@
   "route_handler_authority": "generated app/controllers/**/handler.rb sidecars",
   "language_context": "ruby",
   "contexts_per_isolate": 1,
-  "host_thread_pool_size_per_context": 5,
   "request_multiplexing": true,
-  "worker_definition": "host-thread-not-os-process",
-  "guest_owner_threads_per_context": 5,
-  "execution_concurrency_per_context": 5
+  "worker_definition": "runtime-isolation-cell-not-host-thread",
+  "host_thread_pool_scope": "process-shared",
+  "host_thread_pool_size_source": "infra-runtime-config",
+  "host_threads_reused_across_isolates": true,
+  "host_thread_affinity": "none",
+  "max_execution_concurrency_per_isolate": 5
 }
