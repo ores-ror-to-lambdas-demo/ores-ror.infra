@@ -449,13 +449,17 @@ public final class SupervisorMain {
     }
 
     static Settings test(Path appRoot, String granularity, int workers) {
+      return test(appRoot, new WorkerPlacement(granularity, "lazy", Map.of(), Map.of()), workers);
+    }
+
+    static Settings test(Path appRoot, WorkerPlacement placement, int workers) {
       Path root = appRoot.toAbsolutePath().normalize();
       return new Settings(
         "127.0.0.1",
         0,
         root,
         root.resolve("generated/graal/manifest.json"),
-        new WorkerPlacement(granularity, "lazy", Map.of(), Map.of()),
+        placement,
         "http://127.0.0.1:9/v1",
         "",
         workers,
