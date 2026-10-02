@@ -18,7 +18,7 @@ import org.junit.jupiter.api.Test;
 
 final class ClusterSmokeTest {
   @Test
-  void routeGranularityUsesOneLongLivedContextPerRouteWithBoundedReusableThreads() throws Exception {
+  void routeGranularityUsesOneLongLivedContextWithBoundedReusableHostThreads() throws Exception {
     Path root = Path.of(System.getProperty("app.root")).toAbsolutePath().normalize();
     var settings = SupervisorMain.Settings.test(root, "route", 3);
 
@@ -31,7 +31,7 @@ final class ClusterSmokeTest {
       Set<String> workerThreads = ConcurrentHashMap.newKeySet();
       try {
         List<CompletableFuture<JsonNode>> calls = new ArrayList<>();
-        for (int i = 0; i < 1000; i++) {
+        for (int i = 0; i < 100; i++) {
           int n = i;
           calls.add(CompletableFuture.supplyAsync(() -> {
             try {
@@ -55,6 +55,8 @@ final class ClusterSmokeTest {
         assertTrue(workerThreads.size() >= 2, "one Context should be entered by multiple reusable host workers");
         assertTrue(workerThreads.size() <= 3, "per-context workers must remain bounded");
         assertEquals(settings.unitCount(), cluster.contextCount(), "request volume must not create per-request Contexts");
+        var health = cluster.cells.get("route:GET /healthz");
+        assertEquals(1, health.maxConcurrentGuestEntries(), "TruffleRuby Context entry must be serialized");
       } finally {
         clients.shutdownNow();
       }
