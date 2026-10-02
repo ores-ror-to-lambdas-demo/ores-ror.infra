@@ -1102,16 +1102,23 @@ public final class SupervisorMain {
         executionPool.execute(() -> {
           int entries = guestEntries.incrementAndGet();
           maxGuestEntries.accumulateAndGet(entries, Math::max);
+          T result = null;
+          Throwable failure = null;
           try {
-            future.complete(task.call());
+            result = task.call();
           } catch (Throwable error) {
-            future.completeExceptionally(error);
+            failure = error;
           } finally {
+            // Release worker-local capacity before publishing completion. A
+            // caller awaiting the future may submit its next request
+            // immediately after get() returns.
             guestEntries.decrementAndGet();
             active.decrementAndGet();
             admission.release();
             last.set(System.currentTimeMillis());
           }
+          if (failure == null) future.complete(result);
+          else future.completeExceptionally(failure);
         });
       } catch (RuntimeException error) {
         active.decrementAndGet();
