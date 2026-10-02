@@ -85,15 +85,34 @@ final class ClusterSmokeTest {
   }
 
   @Test
-  void guestNativeExtensionsRemainDisabled() throws Exception {
+  void guestDangerousHostCapabilitiesRemainBlocked() throws Exception {
     Path root = Path.of(System.getProperty("app.root")).toAbsolutePath().normalize();
     try (var cluster = new SupervisorMain.Cluster(SupervisorMain.Settings.test(root, "route", 1))) {
       var worker = cluster.cells.values().iterator().next();
-      String result = worker.context.eval(
+
+      String file = worker.context.eval(
         "ruby",
-        "begin; require 'fiddle'; 'loaded'; rescue LoadError, SecurityError => e; e.class.name; end"
+        "begin; File.read('/etc/passwd'); 'allowed'; rescue Exception => e; e.class.name; end"
       ).asString();
-      assertNotEquals("loaded", result, "guest C/native extension loading must remain disabled");
+      assertNotEquals("allowed", file, "guest filesystem access must remain blocked");
+
+      String process = worker.context.eval(
+        "ruby",
+        "begin; system('true'); 'allowed'; rescue Exception => e; e.class.name; end"
+      ).asString();
+      assertNotEquals("allowed", process, "guest process creation must remain blocked");
+
+      String thread = worker.context.eval(
+        "ruby",
+        "begin; Thread.new { 1 }.join; 'allowed'; rescue Exception => e; e.class.name; end"
+      ).asString();
+      assertNotEquals("allowed", thread, "guest-created threads must remain blocked");
+
+      String hostClass = worker.context.eval(
+        "ruby",
+        "begin; Java.type('java.lang.System'); 'allowed'; rescue Exception => e; e.class.name; end"
+      ).asString();
+      assertNotEquals("allowed", hostClass, "host class lookup must remain blocked");
     }
   }
 
