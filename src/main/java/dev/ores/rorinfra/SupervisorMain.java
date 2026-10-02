@@ -78,7 +78,7 @@ public final class SupervisorMain {
       }, "ror-shutdown"));
       server.start();
       System.out.printf(
-        "Graal Lambda cluster listening on http://%s:%d cells=%d threads/cell=%d%n",
+        "Graal isolate cluster listening on http://%s:%d cells=%d threads/cell=%d%n",
         s.bindHost, s.port, s.minCells, s.workersPerCell
       );
       Thread.currentThread().join();
@@ -145,7 +145,8 @@ public final class SupervisorMain {
     final String bindHost;
     final int port;
     final Path appRoot;
-    final Path bootstrap;
+    final Path commonSourcePath;
+    final Path unitSourcePath;
     final String dataUrl;
     final String dataToken;
     final int minCells;
@@ -160,6 +161,7 @@ public final class SupervisorMain {
       String bindHost,
       int port,
       Path appRoot,
+      String unitRelative,
       String dataUrl,
       String dataToken,
       int minCells,
@@ -173,7 +175,9 @@ public final class SupervisorMain {
       this.bindHost = bindHost;
       this.port = port;
       this.appRoot = appRoot;
-      this.bootstrap = appRoot.resolve("graal/bootstrap.rb").normalize();
+      Path graalRoot = appRoot.resolve("generated/graal").toAbsolutePath().normalize();
+      this.commonSourcePath = graalRoot.resolve("common.rb").normalize();
+      this.unitSourcePath = resolveUnit(graalRoot, unitRelative);
       this.dataUrl = dataUrl;
       this.dataToken = dataToken;
       this.minCells = minCells;
@@ -192,6 +196,7 @@ public final class SupervisorMain {
         env("BIND_HOST", "127.0.0.1"),
         integer("PORT", 8080, 1, 65535),
         Path.of(env("APP_ROOT", "../ores-ror.rb")).toAbsolutePath().normalize(),
+        env("GRAAL_UNIT", "routes/healthz/_get/handler.rb"),
         env("DATA_API_URL", "http://127.0.0.1:8787/v1"),
         env("DATA_API_TOKEN", ""),
         min,
@@ -209,6 +214,7 @@ public final class SupervisorMain {
         "127.0.0.1",
         0,
         root.toAbsolutePath().normalize(),
+        "routes/healthz/_get/handler.rb",
         "http://127.0.0.1:9/v1",
         "",
         cells,
@@ -222,11 +228,11 @@ public final class SupervisorMain {
     }
 
     void validate() {
-      if (!Files.isRegularFile(bootstrap)) {
-        throw new IllegalArgumentException("missing graal/bootstrap.rb: " + bootstrap);
+      if (!Files.isRegularFile(commonSourcePath)) {
+        throw new IllegalArgumentException("missing generated Graal common source: " + commonSourcePath);
       }
-      if (!Files.isRegularFile(appRoot.resolve("generated/lambda/entrypoint.rb"))) {
-        throw new IllegalArgumentException("missing generated Lambda entrypoint under APP_ROOT: " + appRoot);
+      if (!Files.isRegularFile(unitSourcePath)) {
+        throw new IllegalArgumentException("missing generated Graal unit source: " + unitSourcePath);
       }
 
       URI uri = URI.create(dataUrl);
@@ -236,6 +242,18 @@ public final class SupervisorMain {
       if (uri.getHost() == null || uri.getUserInfo() != null || uri.getQuery() != null || uri.getFragment() != null) {
         throw new IllegalArgumentException("DATA_API_URL must be an origin/path without userinfo, query, or fragment");
       }
+    }
+
+    static Path resolveUnit(Path graalRoot, String relative) {
+      Path candidate = Path.of(relative);
+      if (candidate.isAbsolute()) {
+        throw new IllegalArgumentException("GRAAL_UNIT must be relative to generated/graal");
+      }
+      Path resolved = graalRoot.resolve(candidate).normalize();
+      if (!resolved.startsWith(graalRoot) || !relative.endsWith(".rb")) {
+        throw new IllegalArgumentException("GRAAL_UNIT escapes generated/graal or is not Ruby source");
+      }
+      return resolved;
     }
 
     static int integer(String name, int defaultValue, int min, int max) {
@@ -255,6 +273,9 @@ public final class SupervisorMain {
   static final class Cluster implements AutoCloseable {
     final Settings s;
     final HttpBridge http;
+    final Engine engine;
+    final Source commonSource;
+    final Source unitSource;
     final List<Cell> cells = new ArrayList<>();
     final ScheduledExecutorService maintenance = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(named("maintenance"));
     long nextId;
@@ -263,6 +284,17 @@ public final class SupervisorMain {
     Cluster(Settings s) throws Exception {
       this.s = s;
       this.http = new HttpBridge(s.dataUrl, s.dataToken);
+      this.engine = Engine.newBuilder("ruby").build();
+      this.commonSource = Source.newBuilder(
+        "ruby",
+        Files.readString(s.commonSourcePath, StandardCharsets.UTF_8),
+        "generated/graal/common.rb"
+      ).cached(true).build();
+      this.unitSource = Source.newBuilder(
+        "ruby",
+        Files.readString(s.unitSourcePath, StandardCharsets.UTF_8),
+        s.appRoot.relativize(s.unitSourcePath).toString()
+      ).cached(true).build();
       synchronized (this) {
         ensureMin();
       }
@@ -384,7 +416,7 @@ public final class SupervisorMain {
     }
 
     Cell create() throws Exception {
-      return new Cell("cell-" + (++nextId), s, http);
+      return new Cell("cell-" + (++nextId), s, http, engine, commonSource, unitSource);
     }
 
     @Override
@@ -398,13 +430,13 @@ public final class SupervisorMain {
         cell.closeAfterDrain();
       }
       cells.clear();
+      engine.close();
     }
   }
 
   static final class Cell implements AutoCloseable {
     final String id;
     final Settings s;
-    final Engine engine;
     final Context context;
     final Value invoke;
     final ThreadPoolExecutor pool;
@@ -416,10 +448,9 @@ public final class SupervisorMain {
     volatile boolean open = true;
     volatile boolean closed;
 
-    Cell(String id, Settings s, HttpBridge http) throws Exception {
+    Cell(String id, Settings s, HttpBridge http, Engine engine, Source commonSource, Source unitSource) throws Exception {
       this.id = id;
       this.s = s;
-      this.engine = Engine.newBuilder("ruby").build();
 
       Context candidate = Context.newBuilder("ruby")
         .engine(engine)
@@ -432,32 +463,25 @@ public final class SupervisorMain {
         .allowCreateProcess(false)
         .allowCreateThread(false)
         .allowEnvironmentAccess(EnvironmentAccess.NONE)
-        .allowIO(sandboxedIO(s.appRoot))
+        .allowIO(languageHomeOnlyIO())
         .allowPolyglotAccess(PolyglotAccess.NONE)
         .option("ruby.platform-native", "false")
         .option("ruby.cexts", "false")
-        .currentWorkingDirectory(s.appRoot)
         .build();
 
       Value candidateInvoke;
       try {
-        Value bindings = candidate.getBindings("ruby");
-        bindings.putMember("gs_http", (ProxyExecutable) http::call);
-        bindings.putMember("gs_app_root", s.appRoot.toString());
-
-        Source boot = Source.newBuilder(
-          "ruby",
-          Files.readString(s.bootstrap, StandardCharsets.UTF_8),
-          "graal/bootstrap.rb"
-        ).interactive(true).cached(true).build();
-
-        candidateInvoke = candidate.eval(boot);
+        candidate.eval(commonSource);
+        Value factory = candidate.eval(unitSource);
+        if (!factory.canExecute()) {
+          throw new IllegalStateException("generated Graal unit did not return an executable factory");
+        }
+        candidateInvoke = factory.execute((ProxyExecutable) http::call);
         if (!candidateInvoke.canExecute()) {
-          throw new IllegalStateException("bootstrap did not return Lambda invoker");
+          throw new IllegalStateException("generated Graal unit factory did not return an invoker");
         }
       } catch (Exception e) {
         candidate.close(true);
-        engine.close();
         throw e;
       }
 
@@ -581,34 +605,16 @@ public final class SupervisorMain {
       }
       closed = true;
       context.close(cancelIfExecuting);
-      engine.close();
     }
   }
 
-  static IOAccess sandboxedIO(Path appRoot) throws IOException {
-    Path root = appRoot.toRealPath();
-    FileSystem readOnlyHost = FileSystem.newReadOnlyFileSystem(FileSystem.newDefaultFileSystem());
-    FileSystem appOnly = FileSystem.newCompositeFileSystem(
-      FileSystem.newDenyIOFileSystem(),
-      FileSystem.Selector.of(readOnlyHost, path -> withinRoot(root, path))
-    );
-    FileSystem withLanguageHome = FileSystem.allowLanguageHomeAccess(appOnly);
+  static IOAccess languageHomeOnlyIO() {
+    FileSystem denied = FileSystem.newDenyIOFileSystem();
+    FileSystem languageHomeOnly = FileSystem.allowLanguageHomeAccess(denied);
     return IOAccess.newBuilder()
-      .fileSystem(withLanguageHome)
+      .fileSystem(languageHomeOnly)
       .allowHostSocketAccess(false)
       .build();
-  }
-
-  static boolean withinRoot(Path root, Path path) {
-    try {
-      Path candidate = path.isAbsolute() ? path.normalize() : root.resolve(path).normalize();
-      if (!candidate.startsWith(root)) {
-        return false;
-      }
-      return !Files.exists(candidate) || candidate.toRealPath().startsWith(root);
-    } catch (IOException | SecurityException e) {
-      return false;
-    }
   }
 
   static final class HttpBridge {
