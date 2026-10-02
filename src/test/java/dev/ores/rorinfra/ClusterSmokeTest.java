@@ -205,6 +205,14 @@ final class ClusterSmokeTest {
     wrongApplication.put("application", "other-app");
     assertThrows(IllegalArgumentException.class, () -> settings.validateManifest(wrongApplication));
 
+    ObjectNode wrongPoolSize = manifest.deepCopy();
+    wrongPoolSize.put("host_thread_pool_size_per_context", 4);
+    assertThrows(IllegalArgumentException.class, () -> settings.validateManifest(wrongPoolSize));
+
+    ObjectNode wrongUnitPool = manifest.deepCopy();
+    ((ObjectNode) wrongUnitPool.withArray("isolate_units").get(0)).put("host_thread_pool_size", 4);
+    assertThrows(IllegalArgumentException.class, () -> settings.parseUnits(wrongUnitPool, "route"));
+
     ObjectNode wrongSharedSource = manifest.deepCopy();
     ObjectNode firstUnit = (ObjectNode) wrongSharedSource.withArray("isolate_units").get(0);
     firstUnit.withArray("sources").set(
