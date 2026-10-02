@@ -85,6 +85,19 @@ final class ClusterSmokeTest {
   }
 
   @Test
+  void guestNativeExtensionsRemainDisabled() throws Exception {
+    Path root = Path.of(System.getProperty("app.root")).toAbsolutePath().normalize();
+    try (var cluster = new SupervisorMain.Cluster(SupervisorMain.Settings.test(root, "route", 1))) {
+      var worker = cluster.cells.values().iterator().next();
+      String result = worker.context.eval(
+        "ruby",
+        "begin; require 'fiddle'; 'loaded'; rescue LoadError, SecurityError => e; e.class.name; end"
+      ).asString();
+      assertNotEquals("loaded", result, "guest C/native extension loading must remain disabled");
+    }
+  }
+
+  @Test
   void unknownRouteDoesNotAllocateAnIsolate() throws Exception {
     Path root = Path.of(System.getProperty("app.root")).toAbsolutePath().normalize();
     try (var cluster = new SupervisorMain.Cluster(SupervisorMain.Settings.test(root, "route", 2))) {
