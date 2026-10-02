@@ -21,7 +21,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ores-ror-to-lambdas-demo/ores-ror.rb
-          ref: d0ae56d04e1f4c622c9dc39504d52abc908a3a23
+          ref: f0586c086a2e09e5f759de168176ebc6452e3bea
           path: app
           persist-credentials: false
 
