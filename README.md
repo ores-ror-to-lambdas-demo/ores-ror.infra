@@ -54,3 +54,8 @@ Each `GraalWorker` owns:
 - explicit per-request envelopes; thread identity is diagnostic only.
 
 Many HTTP requests may arrive concurrently, but each GraalWorker pins its TruffleRuby Context to one dedicated owner thread for its entire lifetime. The configured value up to 5 is the per-isolate admission limit, not the number of threads entering Ruby. This avoids Context thread migration and concurrent entry while retaining bounded backpressure at the isolate boundary. A request timeout hard-replaces only the affected isolate; max-age replacement creates replacement capacity before the old worker drains. Graal execution remains Rails-free: no `Rails.application`, Action Controller, or Action View is loaded in the guest runtime.
+
+
+### Native-access boundary
+
+TruffleRuby 34 currently requires Polyglot native access even during core startup (for POSIX-backed environment/gem-path resolution). Consequently, `GraalWorker` does not claim that `IOAccess` alone prevents Ruby-native filesystem syscalls. Production tenant isolation must pair the Graal restrictions with an OS/container filesystem sandbox. The Ruby Native Isolate target remains fail-closed until upstream provides the required isolate artifact.
