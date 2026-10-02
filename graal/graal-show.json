@@ -28,10 +28,12 @@
   "database_transport": "host-http",
   "request_identity": "x-request-id",
   "rails_route_authority": "config/routes.rb",
-  "route_handler_authority": "routes/**/handler.rb",
+  "route_handler_authority": "generated app/controllers/**/handler.rb sidecars",
   "language_context": "ruby",
   "contexts_per_isolate": 1,
   "host_thread_pool_size_per_context": 5,
   "request_multiplexing": true,
-  "worker_definition": "host-thread-not-os-process"
+  "worker_definition": "host-thread-not-os-process",
+  "guest_owner_threads_per_context": 5,
+  "execution_concurrency_per_context": 5
 }
