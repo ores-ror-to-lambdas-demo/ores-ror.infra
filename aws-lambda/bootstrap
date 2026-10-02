@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+cd "${LAMBDA_TASK_ROOT:-/var/task}"
+export ORES_BUILD_TARGET="${ORES_BUILD_TARGET:-lambda}"
+
+# Activate the bundle installed at BUNDLE_PATH before starting the custom
+# runtime. Invoking TruffleRuby directly leaves gems such as connection_pool
+# outside Ruby's load path even though they are present in the image.
+exec bundle exec truffleruby aws-lambda/runtime.rb

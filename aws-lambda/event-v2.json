@@ -1,0 +1,22 @@
+{
+  "version": "2.0",
+  "routeKey": "GET /healthz",
+  "rawPath": "/healthz",
+  "rawQueryString": "",
+  "headers": {
+    "accept": "application/json",
+    "host": "example.lambda-url.us-east-1.on.aws",
+    "user-agent": "ores-ror-ci"
+  },
+  "requestContext": {
+    "requestId": "lambda-ci-request",
+    "http": {
+      "method": "GET",
+      "path": "/healthz",
+      "protocol": "HTTP/1.1",
+      "sourceIp": "127.0.0.1",
+      "userAgent": "ores-ror-ci"
+    }
+  },
+  "isBase64Encoded": false
+}

@@ -6,55 +6,104 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+
 jobs:
-  embedded-rails-cluster:
+  runtime-assets-contract:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with: { path: infra }
+        with:
+          path: infra
       - uses: actions/checkout@v4
         with:
           repository: ores-ror-to-lambdas-demo/ores-ror.rb
+          ref: refactor/runtime-assets-to-infra
           path: app
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: truffleruby+graalvm-34.0.1
-          bundler-cache: false
+          bundler-cache: true
           working-directory: app
-      - name: Install Rails gems for embedded TruffleRuby
+
+      - name: Prove runtime adapters live only in infra
+        run: |
+          test -f infra/graal/bootstrap.rb
+          test -f infra/graal/graal-show.json
+          test -f infra/aws-lambda/Dockerfile
+          test -f infra/aws-lambda/adapter.rb
+          test -f infra/aws-lambda/runtime.rb
+          test -f infra/aws-lambda/bootstrap
+          test ! -e app/graal
+          test ! -e app/aws-lambda
+          grep -qx '.bundle' app/.dockerignore
+
+      - name: Generate Rails-free Graal units using infra-owned bootstrap
         working-directory: app
-        run: BUNDLE_PATH=vendor/bundle-truffleruby bundle install --jobs 4 --retry 3
+        env:
+          ORES_BUILD_TARGET: graal
+          ORES_INFRA_ROOT: ${{ github.workspace }}/infra
+        run: |
+          truffleruby bin/build-runtime
+          test -f generated/graal/manifest.json
+          test -f generated/graal/routes/users/'[id]'/_get/handler.rb
+          grep -Fq '# --- infra graal/bootstrap.rb ---' generated/graal/routes/users/'[id]'/_get/handler.rb
+          ! grep -R -E 'config/environment|Rails\.application' generated/graal
+
+      - name: Re-run full Rails-vs-Graal route and middleware parity
+        working-directory: app
+        env:
+          ORES_INFRA_ROOT: ${{ github.workspace }}/infra
+        run: |
+          RAILS_ENV=test ORES_BUILD_TARGET=rails bundle exec rails runner script/rails-contract-export.rb /tmp/rails-contract.json
+          ORES_BUILD_TARGET=graal truffleruby script/graal-contract-export.rb /tmp/graal-contract.json
+          diff -u /tmp/rails-contract.json /tmp/graal-contract.json
+          ruby -rjson -e 'rows=JSON.parse(File.read("/tmp/rails-contract.json")); raise unless rows.map{|r|r.fetch("name")}.uniq.size >= 15; raise unless rows.size == 30'
+
+      - name: Build Lambda image from app + infra contexts
+        run: |
+          docker build \
+            --platform linux/amd64 \
+            --build-context ores_infra=infra \
+            -f infra/aws-lambda/Dockerfile \
+            -t ores-ror-truffleruby-lambda:infra-split \
+            app
+
+      - name: Verify Lambda image and invoke health through RIE
+        run: |
+          docker run --rm --entrypoint truffleruby ores-ror-truffleruby-lambda:infra-split -e 'abort "rails gem present" unless Gem::Specification.find_all_by_name("rails").empty?'
+          curl --fail --location --output aws-lambda-rie https://github.com/aws/aws-lambda-runtime-interface-emulator/releases/latest/download/aws-lambda-rie
+          chmod +x aws-lambda-rie
+          docker run --rm -d --name ores-ror-infra-lambda -p 9000:8080 \
+            -v "$PWD/aws-lambda-rie:/aws-lambda-rie:ro" \
+            --entrypoint /aws-lambda-rie ores-ror-truffleruby-lambda:infra-split /var/runtime/bootstrap
+          for n in $(seq 1 60); do
+            if curl --fail --silent -H 'content-type: application/json' \
+              -d @infra/aws-lambda/event-v2.json \
+              http://127.0.0.1:9000/2015-03-31/functions/function/invocations >lambda-response.json; then
+              break
+            fi
+            sleep 1
+          done
+          cat lambda-response.json
+          grep -q '"statusCode":200' lambda-response.json
+          grep -Fq '"x-ores-execution-mode":"lambda"' lambda-response.json
+          grep -q '"x-ores-runtime":"truffleruby"' lambda-response.json
+      - if: failure()
+        run: docker logs ores-ror-infra-lambda || true
+      - if: always()
+        run: docker rm -f ores-ror-infra-lambda >/dev/null 2>&1 || true
+
+  java-supervisor-compiles:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
         with:
           distribution: graalvm
           java-version: '21'
           cache: maven
-      - name: Build and test 2-cell / 6-worker cluster
-        run: mvn -f infra/pom.xml -Dapp.root="$GITHUB_WORKSPACE/app" test
-      - name: Package runnable supervisor
-        run: mvn -f infra/pom.xml -DskipTests package
-      - name: Boot real Graal Rails cluster and smoke HTTP
-        env:
-          APP_ROOT: ${{ github.workspace }}/app
-          PORT: '3200'
-          MIN_ISOLATES: '2'
-          MAX_ISOLATES: '3'
-          ISOLATE_MAX_CONCURRENCY: '3'
-          DATA_API_URL: http://127.0.0.1:8787/v1
-        run: |
-          java -jar infra/target/ores-ror-infra-0.3.0.jar >graal-cluster.log 2>&1 &
-          echo $! > graal.pid
-          for n in $(seq 1 90); do
-            if curl --fail --silent http://127.0.0.1:3200/healthz >health.json; then break; fi
-            sleep 1
-          done
-          cat health.json
-          grep -q 'truffleruby-graal' health.json
-          seq 1 24 | xargs -P 12 -I{} curl --fail --silent -H 'x-request-id: smoke-{}' http://127.0.0.1:3200/healthz >/dev/null
-          kill $(cat graal.pid)
-      - name: Show cluster log on failure
-        if: failure()
-        run: cat graal-cluster.log || true
+      - name: Compile/package supervisor without the obsolete embedded-Rails smoke
+        run: mvn -DskipTests package
 
   ruby-native-isolate-upstream-capability:
     runs-on: ubuntu-latest

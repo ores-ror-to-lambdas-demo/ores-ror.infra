@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP_ROOT="${APP_ROOT:-$(cd "$ROOT/../ores-ror.rb" && pwd)}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 FUNCTION_NAME="${FUNCTION_NAME:-ores-ror-truffleruby}"
-EVENT_FILE="${1:-$APP_ROOT/aws-lambda/event-v2.json}"
+EVENT_FILE="${1:-$ROOT/aws-lambda/event-v2.json}"
 OUTPUT_FILE="${OUTPUT_FILE:-/tmp/ores-ror-lambda-response.json}"
 
 aws lambda invoke \
