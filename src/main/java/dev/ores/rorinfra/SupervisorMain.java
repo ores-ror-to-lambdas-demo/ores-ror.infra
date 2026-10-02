@@ -413,9 +413,9 @@ public final class SupervisorMain {
       if (manifest.path("contexts_per_isolate").asInt(0) != 1) {
         throw new IllegalArgumentException("Graal manifest must declare exactly one Context per isolate");
       }
-      if (manifest.path("guest_owner_threads_per_context").asInt(0) != 1
-          || manifest.path("execution_concurrency_per_context").asInt(0) != 1) {
-        throw new IllegalArgumentException("each Graal Context must have exactly one guest-owner thread and one executing request");
+      if (manifest.path("guest_owner_threads_per_context").asInt(0) != 5
+          || manifest.path("execution_concurrency_per_context").asInt(0) != 5) {
+        throw new IllegalArgumentException("each Graal Context must declare a five-thread host executor");
       }
       int admissionLimit = manifest.path("max_admitted_in_flight_per_isolate").asInt(0);
       if (admissionLimit < 1 || admissionLimit > 5) {
@@ -498,10 +498,9 @@ public final class SupervisorMain {
           throw new IllegalArgumentException("invalid or duplicate isolate unit: " + key);
         }
         if (unit.path("context_count").asInt(0) != 1
-            || unit.path("guest_owner_threads").asInt(0) != 1
-            || unit.path("execution_concurrency").asInt(0) != 1
-            || unit.path("admission_limit").asInt(0) < 1
-            || unit.path("admission_limit").asInt(0) > 5
+            || unit.path("guest_owner_threads").asInt(0) != 5
+            || unit.path("execution_concurrency").asInt(0) != 5
+            || unit.path("admission_limit").asInt(0) != 5
             || !unit.path("request_multiplexing").asBoolean(false)) {
           throw new IllegalArgumentException("invalid isolate execution contract: " + key);
         }
@@ -810,12 +809,12 @@ public final class SupervisorMain {
       this.settings = settings;
       this.admission = new Semaphore(settings.workersPerIsolate, true);
       this.owner = new ThreadPoolExecutor(
-        1,
-        1,
+        settings.workersPerIsolate,
+        settings.workersPerIsolate,
         0,
         TimeUnit.MILLISECONDS,
-        new ArrayBlockingQueue<>(Math.max(8, settings.workersPerIsolate * 4)),
-        named(safeName(unit.key) + "-guest-owner"),
+        new ArrayBlockingQueue<>(Math.max(8, settings.workersPerIsolate * 2)),
+        named(safeName(unit.key) + "-guest-worker"),
         new ThreadPoolExecutor.AbortPolicy());
 
       RuntimeState state;
