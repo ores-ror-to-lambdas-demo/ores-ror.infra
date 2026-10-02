@@ -12,7 +12,7 @@ done
   cd "$APP_ROOT"
   ORES_BUILD_TARGET=graal \
   ORES_INFRA_ROOT="$ROOT" \
-    ORES_BUILD_OUTPUT=../.ores-generated \
+    ORES_BUILD_OUTPUT=.ores-generated \
     ruby bin/build-runtime
 )
 
@@ -20,4 +20,6 @@ test -f "$APP_ROOT/.ores-generated/graal/common.rb"
 test -f "$APP_ROOT/.ores-generated/graal/manifest.json"
 test -f "$APP_ROOT/.ores-generated/graal/groups/orders/handler.rb"
 test -f "$APP_ROOT/.ores-generated/graal/routes/users/[id]/_get/handler.rb"
+! grep -R -E 'config/environment|Rails\.application|ActionController|ActionView' "$APP_ROOT/.ores-generated/graal"
+! grep -R -F 'require "json"' "$APP_ROOT/.ores-generated/graal"
 mvn -f "$ROOT/pom.xml" -DskipTests package
