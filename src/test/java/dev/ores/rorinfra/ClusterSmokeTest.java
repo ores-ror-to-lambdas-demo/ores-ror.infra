@@ -1,47 +1,164 @@
 package dev.ores.rorinfra;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import java.net.URI;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import org.junit.jupiter.api.Test;
 
 final class ClusterSmokeTest {
   @Test
-  void sameRailsAppRunsAcrossMultipleGraalCellsAndWorkers() throws Exception {
-    Path root=Path.of(System.getProperty("app.root")).toAbsolutePath().normalize();
-    var settings=SupervisorMain.Settings.test(root,2,3);
-    try(var cluster=new SupervisorMain.Cluster(settings)){
-      assertEquals(2,cluster.cellCount());
-      assertEquals(6,cluster.workerCount());
-      ExecutorService clients=Executors.newFixedThreadPool(12);
-      try{
-        List<CompletableFuture<JsonNode>> calls=new ArrayList<>();
-        for(int i=0;i<24;i++){
-          int n=i;
-          calls.add(CompletableFuture.supplyAsync(()->{
-            try{
-              ObjectNode req=SupervisorMain.JSON.createObjectNode();
-              req.put("request_id","gha-"+n); req.put("method","GET"); req.put("path","/healthz");
-              req.put("query_string",""); req.put("body",""); req.put("content_type","application/json");
-              return cluster.invoke(req);
-            }catch(Exception e){throw new RuntimeException(e);}
-          },clients));
-        }
-        for(var call:calls){
-          JsonNode rack=call.get(); assertEquals(200,rack.path("status").asInt());
-          JsonNode body=SupervisorMain.JSON.readTree(rack.path("body").asText());
-          assertTrue(body.path("ok").asBoolean());
-          assertEquals("truffleruby-graal",body.path("runtime").asText());
-        }
-      }finally{clients.shutdownNow();}
+  void routeGranularityUsesOneLongLivedContextWithBoundedAdmission() throws Exception {
+    Path root = Path.of(System.getProperty("app.root")).toAbsolutePath().normalize();
+    var settings = SupervisorMain.Settings.test(root, "route", 3);
+
+    try (var cluster = new SupervisorMain.Cluster(settings)) {
+      assertEquals(0, cluster.contextCount());
+      assertEquals(0, cluster.workerCount());
+      assertEquals(0, cluster.admissionCapacity());
+
+      Set<String> contextIds = ConcurrentHashMap.newKeySet();
+      Set<String> workerThreads = ConcurrentHashMap.newKeySet();
+      for (int i = 0; i < 100; i++) {
+        JsonNode response = cluster.invoke(request("gha-" + i, "GET", "/healthz"));
+        assertEquals(200, response.path("status").asInt(), response.toString());
+        JsonNode body = SupervisorMain.JSON.readTree(response.path("body").asText());
+        assertTrue(body.path("ok").asBoolean(), body.toString());
+        assertEquals("ores-ror.rb", body.path("service").asText());
+        assertTrue(body.path("request_id").asText().startsWith("gha-"), body.toString());
+        contextIds.add(response.path("headers").path("x-ores-graal-context-id").asText());
+        workerThreads.add(response.path("headers").path("x-ores-graal-worker-thread").asText());
+        assertTrue(response.path("headers").path("x-ores-graal-isolate-key").asText().startsWith("route:"));
+      }
+
+      assertEquals(1, contextIds.size(), "one route must keep one Context across request volume");
+      assertEquals(1, workerThreads.size(), "each Context must remain pinned to one guest-owner thread");
+      assertEquals(1, cluster.contextCount(), "one requested route should own one long-lived Context");
+      assertEquals(1, cluster.workerCount());
+      assertEquals(3, cluster.admissionCapacity());
+      var healthRoute = settings.resolveRoute("GET", "/healthz");
+      var health = cluster.cells.get(settings.unitKey(healthRoute));
+      assertEquals(1, health.maxConcurrentGuestEntries(), "TruffleRuby Context entry must be serialized");
     }
+  }
+
+  @Test
+  void routeAndGroupGranularityHaveExpectedIsolationBoundaries() throws Exception {
+    Path root = Path.of(System.getProperty("app.root")).toAbsolutePath().normalize();
+
+    try (var routeCluster = new SupervisorMain.Cluster(SupervisorMain.Settings.test(root, "route", 2))) {
+      JsonNode show = routeCluster.invoke(request("route-show", "GET", "/orders/demo"));
+      JsonNode cancel = routeCluster.invoke(request("route-cancel", "POST", "/orders/demo/cancel"));
+      String showContext = show.path("headers").path("x-ores-graal-context-id").asText();
+      String cancelContext = cancel.path("headers").path("x-ores-graal-context-id").asText();
+      assertTrue(!showContext.isBlank() && !cancelContext.isBlank());
+      assertNotEquals(showContext, cancelContext, "distinct routes must have distinct route-isolate Contexts");
+    }
+
+    try (var groupCluster = new SupervisorMain.Cluster(SupervisorMain.Settings.test(root, "group", 2))) {
+      JsonNode show = groupCluster.invoke(request("group-show", "GET", "/orders/demo"));
+      JsonNode cancel = groupCluster.invoke(request("group-cancel", "POST", "/orders/demo/cancel"));
+      String showContext = show.path("headers").path("x-ores-graal-context-id").asText();
+      String cancelContext = cancel.path("headers").path("x-ores-graal-context-id").asText();
+      assertEquals(showContext, cancelContext, "routes in one group must share exactly one group-isolate Context");
+      assertTrue(show.path("headers").path("x-ores-graal-isolate-key").asText().startsWith("group:orders"));
+    }
+  }
+
+  @Test
+  void enforceableGuestHostCapabilitiesRemainBlocked() throws Exception {
+    Path root = Path.of(System.getProperty("app.root")).toAbsolutePath().normalize();
+    try (var cluster = new SupervisorMain.Cluster(SupervisorMain.Settings.test(root, "route", 1))) {
+      JsonNode health = cluster.invoke(request("capabilities", "GET", "/healthz"));
+      assertEquals(200, health.path("status").asInt());
+      var healthRoute = cluster.settings.resolveRoute("GET", "/healthz");
+      var worker = cluster.cells.get(cluster.settings.unitKey(healthRoute));
+
+      String thread = worker.evalForTest("begin; Thread.new { 1 }.join; 'allowed'; rescue Exception => e; e.class.name; end"
+      );
+      assertNotEquals("allowed", thread, "guest-created threads must remain blocked");
+
+      String hostClass = worker.evalForTest("begin; Java.type('java.lang.System'); 'allowed'; rescue Exception => e; e.class.name; end"
+      );
+      assertNotEquals("allowed", hostClass, "host class lookup must remain blocked");
+    }
+  }
+
+  @Test
+  void unknownRouteDoesNotAllocateAnIsolate() throws Exception {
+    Path root = Path.of(System.getProperty("app.root")).toAbsolutePath().normalize();
+    try (var cluster = new SupervisorMain.Cluster(SupervisorMain.Settings.test(root, "route", 2))) {
+      int before = cluster.contextCount();
+      JsonNode response = cluster.invoke(request("missing", "GET", "/does-not-exist"));
+      assertEquals(404, response.path("status").asInt());
+      assertEquals(before, cluster.contextCount());
+    }
+  }
+
+  @Test
+  void hostHttpBridgeCannotEscapeConfiguredOriginOrBasePath() throws Exception {
+    URI base = URI.create("https://data.example.test/v1/");
+
+    URI target = SupervisorMain.HttpBridge.targetUri(base, "GET", "/users/abc", "a=1");
+    assertEquals("https://data.example.test/v1/users/abc?a=1", target.toString());
+
+    assertThrows(
+      IllegalArgumentException.class,
+      () -> SupervisorMain.HttpBridge.targetUri(base, "TRACE", "/users/abc", "")
+    );
+    assertThrows(
+      IllegalArgumentException.class,
+      () -> SupervisorMain.HttpBridge.targetUri(base, "GET", "/../admin", "")
+    );
+    assertThrows(
+      IllegalArgumentException.class,
+      () -> SupervisorMain.HttpBridge.targetUri(base, "GET", "/%2e%2e/admin", "")
+    );
+    assertThrows(
+      IllegalArgumentException.class,
+      () -> SupervisorMain.HttpBridge.targetUri(base, "GET", "//evil.example/path", "")
+    );
+  }
+
+  @Test
+  void responseHeadersRejectHopByHopInjectionAndOversizedValues() {
+    assertTrue(SupervisorMain.safeResponseHeader("content-type", "application/json"));
+    assertFalse(SupervisorMain.safeResponseHeader("content-length", "42"));
+    assertFalse(SupervisorMain.safeResponseHeader("transfer-encoding", "chunked"));
+    assertFalse(SupervisorMain.safeResponseHeader("x-test", "ok\r\ninjected: true"));
+    assertFalse(SupervisorMain.safeResponseHeader("bad header", "x"));
+    assertFalse(SupervisorMain.safeResponseHeader("x-test", "a".repeat(8193)));
+  }
+
+  @Test
+  void tokenOverCleartextIsOnlyAllowedForLoopbackDataApi() {
+    assertTrue(SupervisorMain.isLoopbackHost("localhost"));
+    assertTrue(SupervisorMain.isLoopbackHost("127.0.0.1"));
+    assertTrue(SupervisorMain.isLoopbackHost("::1"));
+    assertFalse(SupervisorMain.isLoopbackHost("data.example.test"));
+  }
+
+  static ObjectNode request(String id, String method, String path) {
+    ObjectNode request = SupervisorMain.JSON.createObjectNode();
+    request.put("request_id", id);
+    request.put("method", method);
+    request.put("path", path);
+    request.put("query_string", "");
+    request.put("body", "");
+    request.putObject("headers");
+    return request;
   }
 }

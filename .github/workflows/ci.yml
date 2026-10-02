@@ -10,16 +10,19 @@ permissions:
 jobs:
   runtime-assets-contract:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           path: infra
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           repository: ores-ror-to-lambdas-demo/ores-ror.rb
           ref: main
           path: app
-      - uses: ruby/setup-ruby@v1
+      - uses: ruby/setup-ruby@14594264cd68ce8a2345dd349bc3d138a4ef85c8
         with:
           ruby-version: truffleruby+graalvm-34.0.1
           bundler-cache: true
@@ -71,7 +74,8 @@ jobs:
       - name: Verify Lambda image and invoke health through RIE
         run: |
           docker run --rm --entrypoint truffleruby ores-ror-truffleruby-lambda:infra-split -e 'abort "rails gem present" unless Gem::Specification.find_all_by_name("rails").empty?'
-          curl --fail --location --output aws-lambda-rie https://github.com/aws/aws-lambda-runtime-interface-emulator/releases/latest/download/aws-lambda-rie
+          curl --fail --location --retry 3 --output aws-lambda-rie https://github.com/aws/aws-lambda-runtime-interface-emulator/releases/download/v1.37/aws-lambda-rie
+          echo '6b1e686e62ab2baf5759c412c4864276ef2a88b094fca53ec070637ccba9b9a5  aws-lambda-rie' | sha256sum -c -
           chmod +x aws-lambda-rie
           docker run --rm -d --name ores-ror-infra-lambda -p 9000:8080 \
             -v "$PWD/aws-lambda-rie:/aws-lambda-rie:ro" \
@@ -95,9 +99,12 @@ jobs:
 
   java-supervisor-compiles:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
           distribution: graalvm
           java-version: '21'
@@ -105,10 +112,54 @@ jobs:
       - name: Compile/package supervisor without the obsolete embedded-Rails smoke
         run: mvn -DskipTests package
 
+  graal-worker-cluster-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: ores-ror-to-lambdas-demo/ores-ror.rb
+          ref: main
+          path: app
+      - uses: ruby/setup-ruby@14594264cd68ce8a2345dd349bc3d138a4ef85c8
+        with:
+          ruby-version: '3.4'
+          bundler-cache: false
+      - name: Generate Rails-free route/group Graal units
+        working-directory: app
+        env:
+          ORES_BUILD_TARGET: graal
+          ORES_INFRA_ROOT: ${{ github.workspace }}
+        run: ruby bin/build-runtime
+      - name: Assert one-context-per-isolate manifest
+        run: |
+          grep -Fq '"schema": "ores-graal-ruby-manifest/v4"' app/generated/graal/manifest.json
+          grep -Fq '"context_model": "one-long-lived-context-per-route-or-group-isolate"' app/generated/graal/manifest.json
+          grep -Fq '"contexts_per_isolate": 1' app/generated/graal/manifest.json
+          grep -Fq '"guest_owner_threads_per_context": 1' app/generated/graal/manifest.json
+          grep -Fq '"execution_concurrency_per_context": 1' app/generated/graal/manifest.json
+          grep -Fq '"max_admitted_in_flight_per_isolate": 5' app/generated/graal/manifest.json
+          grep -Fq '"engine_scope": "process-shared"' app/generated/graal/manifest.json
+          ! grep -R -E 'config/environment|Rails\.application|ActionController|ActionView' app/generated/graal
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: graalvm
+          java-version: '21'
+          cache: maven
+      - name: Prove GraalWorker route/group isolation and bounded host threads
+        run: mvn -Dapp.root="$GITHUB_WORKSPACE/app" test
+      - name: Package GraalWorker supervisor
+        run: mvn -DskipTests package
+
   ruby-native-isolate-upstream-capability:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
           distribution: graalvm
           java-version: '25'

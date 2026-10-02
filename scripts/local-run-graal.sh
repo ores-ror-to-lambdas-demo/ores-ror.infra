@@ -1,12 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd "$(dirname "$0")/.."
-export APP_ROOT="${APP_ROOT:-$(cd ../ores-ror.rb && pwd)}"
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+APP_ROOT="${APP_ROOT:-$(cd "$ROOT/../ores-ror.rb" && pwd)}"
+
+export APP_ROOT
+export GRAAL_MANIFEST_PATH="${GRAAL_MANIFEST_PATH:-$APP_ROOT/.ores-generated/graal/manifest.json}"
+export ISOLATION_GRANULARITY="${ISOLATION_GRANULARITY:-route}"
 export PORT="${PORT:-3200}"
-export MIN_ISOLATES="${MIN_ISOLATES:-2}"
-export MAX_ISOLATES="${MAX_ISOLATES:-4}"
-export ISOLATE_MAX_CONCURRENCY="${ISOLATE_MAX_CONCURRENCY:-5}"
-export ISOLATE_MAX_AGE_SECONDS="${ISOLATE_MAX_AGE_SECONDS:-1800}"
-export ISOLATE_IDLE_SECONDS="${ISOLATE_IDLE_SECONDS:-300}"
+export CONTEXT_ADMISSION_LIMIT="${CONTEXT_ADMISSION_LIMIT:-${CONTEXT_MAX_CONCURRENCY:-5}}"
+export CONTEXT_MAX_AGE_SECONDS="${CONTEXT_MAX_AGE_SECONDS:-1800}"
+export CONTEXT_IDLE_SECONDS="${CONTEXT_IDLE_SECONDS:-300}"
+export CONTEXT_DRAIN_SECONDS="${CONTEXT_DRAIN_SECONDS:-30}"
+export REQUEST_TIMEOUT_SECONDS="${REQUEST_TIMEOUT_SECONDS:-15}"
 export DATA_API_URL="${DATA_API_URL:-http://127.0.0.1:8787/v1}"
-exec java -jar target/ores-ror-infra-0.3.0.jar
+
+test -f "$GRAAL_MANIFEST_PATH" || {
+  echo "missing $GRAAL_MANIFEST_PATH; run scripts/local-build-graal.sh first" >&2
+  exit 1
+}
+
+exec java -jar "$ROOT/target/ores-ror-infra-0.3.0.jar"
