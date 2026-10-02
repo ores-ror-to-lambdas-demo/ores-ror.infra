@@ -52,4 +52,4 @@ Each `GraalWorker` owns:
 - one bounded host-owned executor, capped at 5 threads;
 - explicit per-request envelopes; thread identity is diagnostic only.
 
-Many HTTP requests may enter the same long-lived Context through those reusable host threads. A request timeout hard-replaces only the affected isolate; max-age replacement creates replacement capacity before the old worker drains. Graal execution remains Rails-free: no `Rails.application`, Action Controller, or Action View is loaded in the guest runtime.
+Many HTTP requests are multiplexed through those reusable host threads onto the same long-lived Context. With the current embedded TruffleRuby 34 runtime, Java-to-Ruby Context entry is serialized per GraalWorker because concurrent host entry into one Context can crash the VM; the host executor remains bounded to 5 reusable threads for admission/queueing and diagnostics. A request timeout hard-replaces only the affected isolate; max-age replacement creates replacement capacity before the old worker drains. Graal execution remains Rails-free: no `Rails.application`, Action Controller, or Action View is loaded in the guest runtime.
