@@ -30,3 +30,27 @@ ORES_BUILD_TARGET=lambda ruby bin/build-runtime
 ```
 
 Generated artifacts stay in the application checkout under `generated/`; this repo only owns hosting/runtime assets.
+
+
+## Worker placement policy
+
+Worker creation is configurable independently from handler generation.
+
+By default:
+
+```text
+GRAAL_WORKER_PLACEMENT=route
+GRAAL_WORKER_STARTUP=lazy
+```
+
+so each generated route unit gets its own `GraalWorker` only when traffic first reaches it.
+
+For explicit mixed placement, set:
+
+```sh
+GRAAL_WORKER_PLACEMENT_FILE=/path/to/worker-placement.json
+```
+
+The file may select any compatible generated isolate-unit key for a route. The supervisor verifies that the selected unit exists and declares that route in its `route_ids` list before creating a worker. This prevents an accidental configuration from silently moving a route into an unrelated context.
+
+Today the compiler emits route and group units. A future compiler may additionally emit trust-domain units such as `domain:public`, `domain:private`, and `domain:admin`; the same placement API is designed to accept those once they exist.
