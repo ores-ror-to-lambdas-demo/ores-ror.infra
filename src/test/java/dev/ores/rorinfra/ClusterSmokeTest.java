@@ -23,9 +23,9 @@ final class ClusterSmokeTest {
     var settings = SupervisorMain.Settings.test(root, "route", 3);
 
     try (var cluster = new SupervisorMain.Cluster(settings)) {
-      assertEquals(settings.unitCount(), cluster.contextCount());
-      assertEquals(settings.unitCount(), cluster.workerCount());
-      assertEquals(settings.unitCount() * 3, cluster.admissionCapacity());
+      assertEquals(0, cluster.contextCount());
+      assertEquals(0, cluster.workerCount());
+      assertEquals(0, cluster.admissionCapacity());
 
       ExecutorService clients = Executors.newFixedThreadPool(18);
       Set<String> contextIds = ConcurrentHashMap.newKeySet();
@@ -54,7 +54,9 @@ final class ClusterSmokeTest {
         }
         assertEquals(1, contextIds.size(), "one route must keep one Context across request volume");
         assertEquals(1, workerThreads.size(), "each Context must remain pinned to one guest-owner thread");
-        assertEquals(settings.unitCount(), cluster.contextCount(), "request volume must not create per-request Contexts");
+        assertEquals(1, cluster.contextCount(), "one requested route should own one long-lived Context");
+        assertEquals(1, cluster.workerCount());
+        assertEquals(3, cluster.admissionCapacity());
         var health = cluster.cells.get("route:GET /healthz");
         assertEquals(1, health.maxConcurrentGuestEntries(), "TruffleRuby Context entry must be serialized");
       } finally {
@@ -90,7 +92,9 @@ final class ClusterSmokeTest {
   void guestDangerousHostCapabilitiesRemainBlocked() throws Exception {
     Path root = Path.of(System.getProperty("app.root")).toAbsolutePath().normalize();
     try (var cluster = new SupervisorMain.Cluster(SupervisorMain.Settings.test(root, "route", 1))) {
-      var worker = cluster.cells.values().iterator().next();
+      JsonNode health = cluster.invoke(request("capabilities", "GET", "/healthz"));
+      assertEquals(200, health.path("status").asInt());
+      var worker = cluster.cells.get("route:GET /healthz");
 
       String file = worker.evalForTest("begin; File.read('/etc/passwd'); 'allowed'; rescue Exception => e; e.class.name; end"
       );
