@@ -11,6 +11,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import java.net.URI;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -169,6 +170,65 @@ final class ClusterSmokeTest {
   void strictUtf8DecoderRejectsMalformedInput() throws Exception {
     assertEquals("hello ✓", SupervisorMain.decodeUtf8Strict("hello ✓".getBytes(StandardCharsets.UTF_8)));
     assertThrows(CharacterCodingException.class, () -> SupervisorMain.decodeUtf8Strict(new byte[] {(byte) 0xC3, (byte) 0x28}));
+  }
+
+  @Test
+  void manifestIdentityAndUnitSourceContractFailClosed() throws Exception {
+    Path root = Path.of(System.getProperty("app.root")).toAbsolutePath().normalize();
+    var settings = SupervisorMain.Settings.test(root, "route", 2);
+    ObjectNode manifest = (ObjectNode) SupervisorMain.JSON.readTree(
+      Files.readString(root.resolve("generated/graal/manifest.json"), StandardCharsets.UTF_8));
+
+    ObjectNode wrongApplication = manifest.deepCopy();
+    wrongApplication.put("application", "other-app");
+    assertThrows(IllegalArgumentException.class, () -> settings.validateManifest(wrongApplication));
+
+    ObjectNode wrongSharedSource = manifest.deepCopy();
+    wrongSharedSource.withArray("isolate_units").get(0).withArray("sources").set(
+      0, SupervisorMain.JSON.getNodeFactory().textNode("generated/graal/not-common.rb"));
+    assertThrows(IllegalArgumentException.class, () -> settings.parseUnits(wrongSharedSource, "route"));
+
+    ObjectNode duplicateRouteId = manifest.deepCopy();
+    String firstId = duplicateRouteId.withArray("routes").get(0).path("route_id").asText();
+    ((ObjectNode) duplicateRouteId.withArray("routes").get(1)).put("route_id", firstId);
+    assertThrows(IllegalArgumentException.class, () -> settings.parseRoutes(duplicateRouteId));
+  }
+
+  @Test
+  void guestResponseEnvelopeAndGeneratedSourceValidationFailClosed() throws Exception {
+    ObjectNode valid = SupervisorMain.JSON.createObjectNode();
+    valid.putObject("headers").put("content-type", "application/json");
+    valid.put("body", "{}");
+    SupervisorMain.GraalWorker.validateGuestResponse(valid);
+
+    ObjectNode missingBody = SupervisorMain.JSON.createObjectNode();
+    missingBody.putObject("headers");
+    assertThrows(IllegalStateException.class, () -> SupervisorMain.GraalWorker.validateGuestResponse(missingBody));
+
+    ObjectNode tooManyHeaders = SupervisorMain.JSON.createObjectNode();
+    ObjectNode headers = tooManyHeaders.putObject("headers");
+    for (int i = 0; i <= SupervisorMain.MAX_RESPONSE_HEADERS; i++) headers.put("x-test-" + i, "v");
+    tooManyHeaders.put("body", "{}");
+    assertThrows(IllegalStateException.class, () -> SupervisorMain.GraalWorker.validateGuestResponse(tooManyHeaders));
+
+    Path source = Files.createTempFile("ores-graal-source", ".rb");
+    try {
+      Files.writeString(source, "ActionController::Base\n", StandardCharsets.UTF_8);
+      assertThrows(
+        IllegalArgumentException.class,
+        () -> SupervisorMain.Settings.readRubySource(source, "adversarial generated source"));
+    } finally {
+      Files.deleteIfExists(source);
+    }
+  }
+
+  @Test
+  void hostHttpBridgeRejectsOversizedTargets() {
+    URI base = URI.create("https://data.example.test/v1/");
+    assertThrows(
+      IllegalArgumentException.class,
+      () -> SupervisorMain.HttpBridge.targetUri(base, "GET", "/" + "a".repeat(SupervisorMain.MAX_BRIDGE_URL), "")
+    );
   }
 
   static ObjectNode request(String id, String method, String path) {
