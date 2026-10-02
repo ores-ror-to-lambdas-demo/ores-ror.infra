@@ -9,6 +9,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import java.net.URI;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -129,6 +131,10 @@ final class ClusterSmokeTest {
     );
     assertThrows(
       IllegalArgumentException.class,
+      () -> SupervisorMain.HttpBridge.targetUri(base, "GET", "/%252e%252e/admin", "")
+    );
+    assertThrows(
+      IllegalArgumentException.class,
       () -> SupervisorMain.HttpBridge.targetUri(base, "GET", "//evil.example/path", "")
     );
   }
@@ -149,6 +155,12 @@ final class ClusterSmokeTest {
     assertTrue(SupervisorMain.isLoopbackHost("127.0.0.1"));
     assertTrue(SupervisorMain.isLoopbackHost("::1"));
     assertFalse(SupervisorMain.isLoopbackHost("data.example.test"));
+  }
+
+  @Test
+  void strictUtf8DecoderRejectsMalformedInput() throws Exception {
+    assertEquals("hello ✓", SupervisorMain.decodeUtf8Strict("hello ✓".getBytes(StandardCharsets.UTF_8)));
+    assertThrows(CharacterCodingException.class, () -> SupervisorMain.decodeUtf8Strict(new byte[] {(byte) 0xC3, (byte) 0x28}));
   }
 
   static ObjectNode request(String id, String method, String path) {
