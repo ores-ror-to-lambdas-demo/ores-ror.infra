@@ -20,7 +20,7 @@ jobs:
         with:
           persist-credentials: false
           repository: ores-ror-to-lambdas-demo/ores-ror.rb
-          ref: d3a90920ca5ab0639551c40dde18b44889027352
+          ref: 36c442b7a8fc618e97ab2c28f14f3a4a22d73c26
           path: app
       - uses: ruby/setup-ruby@14594264cd68ce8a2345dd349bc3d138a4ef85c8
         with:
@@ -124,7 +124,7 @@ jobs:
         with:
           persist-credentials: false
           repository: ores-ror-to-lambdas-demo/ores-ror.rb
-          ref: d3a90920ca5ab0639551c40dde18b44889027352
+          ref: 36c442b7a8fc618e97ab2c28f14f3a4a22d73c26
           path: app
       - uses: ruby/setup-ruby@14594264cd68ce8a2345dd349bc3d138a4ef85c8
         with:
@@ -141,6 +141,7 @@ jobs:
           grep -Fq '"schema": "ores-graal-ruby-manifest/v4"' app/generated/graal/manifest.json
           grep -Fq '"context_model": "one-long-lived-context-per-route-or-group-isolate"' app/generated/graal/manifest.json
           grep -Fq '"contexts_per_isolate": 1' app/generated/graal/manifest.json
+          grep -Fq '"host_thread_pool_size_per_context": 5' app/generated/graal/manifest.json
           grep -Fq '"guest_owner_threads_per_context": 5' app/generated/graal/manifest.json
           grep -Fq '"execution_concurrency_per_context": 5' app/generated/graal/manifest.json
           grep -Fq '"max_admitted_in_flight_per_isolate": 5' app/generated/graal/manifest.json
