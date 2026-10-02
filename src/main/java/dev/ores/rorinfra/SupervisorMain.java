@@ -530,6 +530,14 @@ public final class SupervisorMain {
         }
       }
       for (RouteDef route : routes) {
+        String identity = route.verb + " " + route.path;
+        String byId = placement.routeAssignments.get(route.routeId);
+        String byIdentity = placement.routeIdentityAssignments.get(identity);
+        if (byId != null && byIdentity != null && !byId.equals(byIdentity)) {
+          throw new IllegalArgumentException(
+            "worker placement has conflicting assignments for " + route.routeId + " / " + identity);
+        }
+
         String key = placement.unitKey(route);
         UnitDef unit = units.get(key);
         if (unit == null) {
@@ -805,20 +813,35 @@ public final class SupervisorMain {
         new ArrayBlockingQueue<>(Math.max(64, Math.min(4096, settings.graalThreadPoolSize * 16)), true),
         named("graal-guest"),
         new ThreadPoolExecutor.AbortPolicy());
-      this.commonSource = source(settings.commonSource, "generated/graal/common.rb");
-      for (UnitDef unit : settings.units.values()) {
-        unitSources.put(unit.key, source(unit.unitSource, unit.unitPath.getFileName().toString() + "-" + safeName(unit.key)));
-      }
-      if (settings.placement.eager()) {
-        for (String key : settings.selectedUnitKeys()) {
-          UnitDef unit = settings.units.get(key);
-          if (unit == null) throw new IllegalStateException("missing eager worker unit " + key);
-          cells.put(key, create(unit));
+      try {
+        this.commonSource = source(settings.commonSource, "generated/graal/common.rb");
+        for (UnitDef unit : settings.units.values()) {
+          unitSources.put(unit.key, source(unit.unitSource, unit.unitPath.getFileName().toString() + "-" + safeName(unit.key)));
         }
+        if (settings.placement.eager()) {
+          for (String key : settings.selectedUnitKeys()) {
+            UnitDef unit = settings.units.get(key);
+            if (unit == null) throw new IllegalStateException("missing eager worker unit " + key);
+            cells.put(key, create(unit));
+          }
+        }
+        // Lazy mode creates a worker only on the first request that selects its
+        // configured unit. Eager mode prewarms every distinct selected unit.
+        maintenance.scheduleAtFixedRate(this::maintainSafe, 1, 1, TimeUnit.SECONDS);
+      } catch (Exception | Error error) {
+        closed = true;
+        maintenance.shutdownNow();
+        for (GraalWorker cell : cells.values()) cell.hardCancel("cluster initialization failure");
+        cells.clear();
+        draining.clear();
+        guestExecutor.shutdownNow();
+        try {
+          engine.close();
+        } catch (Throwable cleanupFailure) {
+          error.addSuppressed(cleanupFailure);
+        }
+        throw error;
       }
-      // Lazy mode creates a worker only on the first request that selects its
-      // configured unit. Eager mode prewarms every distinct selected unit.
-      maintenance.scheduleAtFixedRate(this::maintainSafe, 1, 1, TimeUnit.SECONDS);
     }
 
     static Source source(String code, String name) throws IOException {
@@ -838,6 +861,7 @@ public final class SupervisorMain {
       GraalWorker cell;
       CompletableFuture<JsonNode> future;
       synchronized (this) {
+        if (closed) throw new RejectedExecutionException("Graal cluster is closed");
         maintain(System.currentTimeMillis());
         UnitDef unit = settings.unitFor(route);
         cell = cells.get(unit.key);
@@ -892,6 +916,7 @@ public final class SupervisorMain {
     }
 
     GraalWorker create(UnitDef unit) throws Exception {
+      if (closed) throw new RejectedExecutionException("Graal cluster is closed");
       Source unitSource = unitSources.get(unit.key);
       if (unitSource == null) throw new IllegalStateException("missing cached Source for " + unit.key);
       return new GraalWorker("isolate-" + (++nextId), unit, settings, engine, guestExecutor, commonSource, unitSource, http);
@@ -954,10 +979,45 @@ public final class SupervisorMain {
       if (closed) return;
       closed = true;
       maintenance.shutdownNow();
-      for (GraalWorker cell : cells.values()) cell.closeAfterDrain();
-      for (GraalWorker cell : draining) cell.closeAfterDrain();
+
+      java.util.LinkedHashSet<GraalWorker> all = new java.util.LinkedHashSet<>();
+      all.addAll(cells.values());
+      all.addAll(draining);
+      for (GraalWorker cell : all) cell.retire("cluster shutdown");
+
+      long deadline = System.currentTimeMillis() + settings.drainMs;
+      while (System.currentTimeMillis() < deadline) {
+        boolean busy = false;
+        for (GraalWorker cell : all) {
+          if (!cell.closed() && cell.load() != 0) {
+            busy = true;
+            break;
+          }
+        }
+        if (!busy) break;
+        try {
+          Thread.sleep(10);
+        } catch (InterruptedException error) {
+          Thread.currentThread().interrupt();
+          break;
+        }
+      }
+
+      RuntimeException failure = null;
+      for (GraalWorker cell : all) {
+        try {
+          if (cell.closed()) continue;
+          if (cell.load() != 0) cell.hardCancel("cluster shutdown drain timeout");
+          else cell.close();
+        } catch (RuntimeException error) {
+          cell.hardCancel("cluster shutdown close failure");
+          if (failure == null) failure = new IllegalStateException("failed to close one or more Graal workers");
+          failure.addSuppressed(error);
+        }
+      }
       cells.clear();
       draining.clear();
+
       guestExecutor.shutdown();
       try {
         if (!guestExecutor.awaitTermination(Math.max(1, settings.drainMs), TimeUnit.MILLISECONDS)) {
@@ -967,7 +1027,14 @@ public final class SupervisorMain {
         Thread.currentThread().interrupt();
         guestExecutor.shutdownNow();
       }
-      engine.close();
+
+      try {
+        engine.close();
+      } catch (RuntimeException error) {
+        if (failure == null) failure = new IllegalStateException("failed to close Graal engine");
+        failure.addSuppressed(error);
+      }
+      if (failure != null) throw failure;
     }
   }
 
@@ -1246,41 +1313,18 @@ public final class SupervisorMain {
       if (closed) return;
       open = false;
       if (load() != 0) throw new IllegalStateException("isolate busy: " + unit.key);
-      java.util.concurrent.Future<?> closing;
       try {
-        closing = executionPool.submit(() -> {
-          context.close();
-          return null;
-        });
-      } catch (RejectedExecutionException rejected) {
+        context.close();
+        closed = true;
+      } catch (Throwable error) {
         try {
           context.close(true);
-        } catch (Throwable error) {
-          rejected.addSuppressed(error);
+        } catch (Throwable forceFailure) {
+          error.addSuppressed(forceFailure);
         }
         closed = true;
-        return;
-      }
-      try {
-        closing.get(Math.max(1, settings.drainMs), TimeUnit.MILLISECONDS);
-      } catch (TimeoutException error) {
-        closing.cancel(true);
-        try {
-          context.close(true);
-        } catch (Throwable ignored) {
-          // preserve the lifecycle timeout as the primary failure
-        }
-        throw new IllegalStateException("timed out closing isolate " + unit.key, error);
-      } catch (Exception error) {
-        closing.cancel(true);
-        try {
-          context.close(true);
-        } catch (Throwable ignored) {
-          // preserve the executor/close failure as primary
-        }
         throw new IllegalStateException("failed to close isolate " + unit.key, error);
       }
-      closed = true;
     }
   }
 
