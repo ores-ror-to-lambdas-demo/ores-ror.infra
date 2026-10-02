@@ -1,0 +1,11 @@
+{
+  "schema": "ores-graal-worker-placement/v1",
+  "default_strategy": "route",
+  "startup": "lazy",
+  "route_assignments": {},
+  "route_identity_assignments": {
+    "GET /orders/:id": "group:orders",
+    "GET /orders/:id/receipt": "group:orders",
+    "POST /orders/:id/cancel": "group:orders"
+  }
+}
