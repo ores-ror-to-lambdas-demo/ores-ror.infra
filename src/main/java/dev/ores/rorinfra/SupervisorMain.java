@@ -56,6 +56,15 @@ import org.graalvm.polyglot.proxy.ProxyExecutable;
 public final class SupervisorMain {
   static final ObjectMapper JSON = new ObjectMapper();
   static final int MAX_BODY = 1024 * 1024;
+  static final int MAX_GUEST_RESPONSE = 2 * 1024 * 1024;
+  static final int MAX_MANIFEST_BYTES = 1024 * 1024;
+  static final int MAX_SOURCE_BYTES = 4 * 1024 * 1024;
+  static final int MAX_ROUTES = 1024;
+  static final int MAX_UNITS = 2048;
+  static final int MAX_ROUTE_PATH = 2048;
+  static final int MAX_IDENTIFIER = 256;
+  static final int MAX_BRIDGE_URL = 16 * 1024;
+  static final int MAX_RESPONSE_HEADERS = 64;
   static final Set<String> HTTP_METHODS = Set.of("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS");
   static final Set<String> HOP_BY_HOP_HEADERS = Set.of(
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -68,8 +77,15 @@ public final class SupervisorMain {
   public static void main(String[] args) throws Exception {
     Settings settings = Settings.fromEnv();
     try (Cluster cluster = new Cluster(settings)) {
-      ExecutorService ingress = Executors.newFixedThreadPool(
-        Math.max(8, settings.unitCount() * settings.workersPerIsolate), named("ingress"));
+      int ingressThreads = Math.max(8, Math.min(64, settings.unitCount() * Math.min(settings.workersPerIsolate, 2)));
+      ThreadPoolExecutor ingress = new ThreadPoolExecutor(
+        ingressThreads,
+        ingressThreads,
+        0,
+        TimeUnit.MILLISECONDS,
+        new ArrayBlockingQueue<>(Math.min(1024, Math.max(128, ingressThreads * 8))),
+        named("ingress"),
+        new ThreadPoolExecutor.CallerRunsPolicy());
       HttpServer server = HttpServer.create(new InetSocketAddress(settings.bindHost, settings.port), 256);
       server.setExecutor(ingress);
       server.createContext("/", exchange -> handle(exchange, cluster));
@@ -92,6 +108,19 @@ public final class SupervisorMain {
 
   static void handle(HttpExchange exchange, Cluster cluster) throws IOException {
     try {
+      String method = exchange.getRequestMethod().toUpperCase(Locale.ROOT);
+      if (!HTTP_METHODS.contains(method)) {
+        sendError(exchange, 405, "unsupported HTTP method");
+        return;
+      }
+      String path = exchange.getRequestURI().getPath();
+      String rawQuery = exchange.getRequestURI().getRawQuery();
+      if (path == null || path.length() > MAX_ROUTE_PATH || path.indexOf('\0') >= 0
+          || (rawQuery != null && rawQuery.length() > MAX_BRIDGE_URL)) {
+        sendError(exchange, 414, "request target too large or invalid");
+        return;
+      }
+
       byte[] input = exchange.getRequestBody().readNBytes(MAX_BODY + 1);
       if (input.length > MAX_BODY) {
         sendError(exchange, 413, "request body too large");
@@ -100,15 +129,27 @@ public final class SupervisorMain {
 
       ObjectNode request = JSON.createObjectNode();
       request.put("request_id", requestId(exchange.getRequestHeaders().getFirst("x-request-id")));
-      request.put("method", exchange.getRequestMethod());
-      request.put("path", exchange.getRequestURI().getPath());
-      request.put("query_string", exchange.getRequestURI().getRawQuery() == null ? "" : exchange.getRequestURI().getRawQuery());
+      request.put("method", method);
+      request.put("path", path);
+      request.put("query_string", rawQuery == null ? "" : rawQuery);
       request.put("body", decodeUtf8Strict(input));
       ObjectNode headers = request.putObject("headers");
       String contentType = exchange.getRequestHeaders().getFirst("content-type");
-      if (contentType != null) headers.put("content-type", contentType);
+      if (contentType != null) {
+        if (contentType.length() > 8192) {
+          sendError(exchange, 431, "content-type header too large");
+          return;
+        }
+        headers.put("content-type", contentType);
+      }
       String accept = exchange.getRequestHeaders().getFirst("accept");
-      if (accept != null) headers.put("accept", accept);
+      if (accept != null) {
+        if (accept.length() > 8192) {
+          sendError(exchange, 431, "accept header too large");
+          return;
+        }
+        headers.put("accept", accept);
+      }
 
       JsonNode result = cluster.invoke(request);
       int status = result.path("status").asInt(500);
@@ -263,6 +304,12 @@ public final class SupervisorMain {
           || uri.getRawFragment() != null) {
         throw new IllegalArgumentException("DATA_API_URL must be an http(s) origin/base path without credentials, query, or fragment");
       }
+      if (dataUrl.length() > 4096) {
+        throw new IllegalArgumentException("DATA_API_URL is too long");
+      }
+      if (dataToken.length() > 8192 || dataToken.indexOf('\r') >= 0 || dataToken.indexOf('\n') >= 0) {
+        throw new IllegalArgumentException("DATA_API_TOKEN is too long or contains invalid control characters");
+      }
       if (!dataToken.isEmpty() && "http".equalsIgnoreCase(uri.getScheme()) && !isLoopbackHost(uri.getHost())) {
         throw new IllegalArgumentException("DATA_API_TOKEN requires HTTPS unless DATA_API_URL is loopback");
       }
@@ -274,6 +321,9 @@ public final class SupervisorMain {
           throw new IllegalArgumentException("GRAAL_MANIFEST_PATH must remain inside APP_ROOT");
         }
         this.artifactRoot = realManifest.getParent();
+        if (Files.size(realManifest) > MAX_MANIFEST_BYTES) {
+          throw new IllegalArgumentException("generated Graal manifest exceeds size limit");
+        }
         JsonNode manifest = JSON.readTree(Files.readString(realManifest, StandardCharsets.UTF_8));
         validateManifest(manifest);
         Path commonPath = resolveArtifact(manifest.path("shared_source").asText());
@@ -349,6 +399,11 @@ public final class SupervisorMain {
       if (!"ores-graal-ruby-manifest/v4".equals(manifest.path("schema").asText())) {
         throw new IllegalArgumentException("unsupported Graal manifest schema");
       }
+      if (!"ores-ror.rb".equals(manifest.path("application").asText())
+          || !"truffleruby".equals(manifest.path("runtime").asText())
+          || !"generated/graal/common.rb".equals(manifest.path("shared_source").asText())) {
+        throw new IllegalArgumentException("unexpected Graal application/runtime/source identity");
+      }
       if (manifest.path("rails_boot").asBoolean(true) || manifest.path("rails_application_initialized").asBoolean(true)) {
         throw new IllegalArgumentException("Graal manifest must be Rails-free");
       }
@@ -375,23 +430,44 @@ public final class SupervisorMain {
       if (!"process-shared".equals(manifest.path("engine_scope").asText())) {
         throw new IllegalArgumentException("Graal manifest must use a process-shared Engine");
       }
+      if (!"explicit-per-invocation".equals(manifest.path("request_state").asText())
+          || manifest.path("thread_identity_is_request_identity").asBoolean(true)
+          || manifest.path("guest_filesystem").asBoolean(true)
+          || manifest.path("guest_created_threads").asBoolean(true)
+          || manifest.path("child_processes").asBoolean(true)
+          || manifest.path("native_ffi").asBoolean(true)
+          || manifest.path("raw_sockets").asBoolean(true)
+          || !"host-http".equals(manifest.path("database_transport").asText())
+          || !"ores_gs_http".equals(manifest.path("host_http_binding").asText())) {
+        throw new IllegalArgumentException("Graal manifest violates required capability/request-state contract");
+      }
     }
 
     List<RouteDef> parseRoutes(JsonNode manifest) {
+      JsonNode routeNodes = manifest.path("routes");
+      if (!routeNodes.isArray() || routeNodes.isEmpty() || routeNodes.size() > MAX_ROUTES) {
+        throw new IllegalArgumentException("Graal manifest route count is invalid");
+      }
       List<RouteDef> parsed = new ArrayList<>();
       Set<String> identities = new java.util.HashSet<>();
-      for (JsonNode route : manifest.path("routes")) {
+      Set<String> routeIds = new java.util.HashSet<>();
+      for (JsonNode route : routeNodes) {
         String verb = route.path("verb").asText().toUpperCase(Locale.ROOT);
         String path = route.path("path").asText();
         String routeId = route.path("route_id").asText();
         String group = route.path("group").asText();
-        if (!HTTP_METHODS.contains(verb) || !path.startsWith("/") || path.indexOf('\0') >= 0
-            || routeId.isBlank() || group.isBlank()) {
+        if (!HTTP_METHODS.contains(verb) || !path.startsWith("/") || path.length() > MAX_ROUTE_PATH
+            || path.indexOf('\0') >= 0 || path.indexOf('\\') >= 0 || path.indexOf('?') >= 0 || path.indexOf('#') >= 0
+            || routeId.isBlank() || routeId.length() > MAX_IDENTIFIER
+            || group.isBlank() || group.length() > MAX_IDENTIFIER) {
           throw new IllegalArgumentException("invalid route entry in Graal manifest");
         }
         String identity = verb + " " + path;
         if (!identities.add(identity)) {
           throw new IllegalArgumentException("duplicate route in Graal manifest: " + identity);
+        }
+        if (!routeIds.add(routeId)) {
+          throw new IllegalArgumentException("duplicate route_id in Graal manifest: " + routeId);
         }
         parsed.add(new RouteDef(verb, path, routeId, group));
       }
@@ -399,8 +475,13 @@ public final class SupervisorMain {
     }
 
     Map<String, UnitDef> parseUnits(JsonNode manifest, String selectedKind) {
+      JsonNode unitNodes = manifest.path("isolate_units");
+      if (!unitNodes.isArray() || unitNodes.isEmpty() || unitNodes.size() > MAX_UNITS) {
+        throw new IllegalArgumentException("Graal manifest isolate-unit count is invalid");
+      }
+      String sharedSource = manifest.path("shared_source").asText();
       Map<String, UnitDef> parsed = new LinkedHashMap<>();
-      for (JsonNode unit : manifest.path("isolate_units")) {
+      for (JsonNode unit : unitNodes) {
         String kind = unit.path("kind").asText();
         if (!selectedKind.equals(kind)) continue;
         String key = unit.path("key").asText();
@@ -408,10 +489,12 @@ public final class SupervisorMain {
         List<String> ids = new ArrayList<>();
         unit.path("route_ids").forEach(id -> ids.add(id.asText()));
         JsonNode sources = unit.path("sources");
-        if (!sources.isArray() || sources.size() != 2) {
-          throw new IllegalArgumentException("isolate unit must contain common + unit source: " + key);
+        if (!sources.isArray() || sources.size() != 2 || !sharedSource.equals(sources.get(0).asText())) {
+          throw new IllegalArgumentException("isolate unit must contain the declared common + unit source: " + key);
         }
-        if (key.isBlank() || group.isBlank() || ids.isEmpty() || parsed.containsKey(key)) {
+        if (key.isBlank() || key.length() > MAX_IDENTIFIER + 16
+            || group.isBlank() || group.length() > MAX_IDENTIFIER
+            || ids.isEmpty() || ids.size() > MAX_ROUTES || parsed.containsKey(key)) {
           throw new IllegalArgumentException("invalid or duplicate isolate unit: " + key);
         }
         if (unit.path("context_count").asInt(0) != 1
@@ -426,7 +509,46 @@ public final class SupervisorMain {
         String source = readRubySource(unitPath, "Graal isolate unit " + key);
         parsed.put(key, new UnitDef(kind, key, group, ids, unitPath, source));
       }
+      validateUnitCoverage(parsed, selectedKind);
       return Map.copyOf(parsed);
+    }
+
+    void validateUnitCoverage(Map<String, UnitDef> parsed, String selectedKind) {
+      Map<String, RouteDef> byId = new HashMap<>();
+      Map<String, List<RouteDef>> byGroup = new HashMap<>();
+      for (RouteDef route : routes) {
+        byId.put(route.routeId, route);
+        byGroup.computeIfAbsent(route.group, ignored -> new ArrayList<>()).add(route);
+      }
+
+      Set<String> covered = new java.util.HashSet<>();
+      for (UnitDef unit : parsed.values()) {
+        if ("route".equals(selectedKind)) {
+          if (unit.routeIds.size() != 1) throw new IllegalArgumentException("route isolate must contain exactly one route: " + unit.key);
+          RouteDef route = byId.get(unit.routeIds.get(0));
+          if (route == null || !unit.key.equals("route:" + route.routeId) || !unit.group.equals(route.group)) {
+            throw new IllegalArgumentException("route isolate does not match route metadata: " + unit.key);
+          }
+          if (!covered.add(route.routeId)) throw new IllegalArgumentException("route is covered by multiple isolate units: " + route.routeId);
+        } else {
+          List<RouteDef> expected = byGroup.get(unit.group);
+          if (expected == null || !unit.key.equals("group:" + unit.group)) {
+            throw new IllegalArgumentException("group isolate does not match route metadata: " + unit.key);
+          }
+          Set<String> expectedIds = new java.util.HashSet<>();
+          expected.forEach(route -> expectedIds.add(route.routeId));
+          Set<String> actualIds = new java.util.HashSet<>(unit.routeIds);
+          if (actualIds.size() != unit.routeIds.size() || !actualIds.equals(expectedIds)) {
+            throw new IllegalArgumentException("group isolate route_ids do not exactly match group routes: " + unit.key);
+          }
+          for (String routeId : actualIds) {
+            if (!covered.add(routeId)) throw new IllegalArgumentException("route is covered by multiple isolate units: " + routeId);
+          }
+        }
+      }
+      if (covered.size() != routes.size()) {
+        throw new IllegalArgumentException("selected isolate units do not cover every route exactly once");
+      }
     }
 
     Path resolveArtifact(String manifestPath) {
@@ -446,8 +568,12 @@ public final class SupervisorMain {
 
     static String readRubySource(Path path, String label) {
       try {
+        if (Files.size(path) > MAX_SOURCE_BYTES) {
+          throw new IllegalArgumentException(label + " exceeds generated source size limit");
+        }
         String source = Files.readString(path, StandardCharsets.UTF_8);
-        if (source.contains("config/environment") || source.contains("Rails.application")) {
+        if (source.contains("config/environment") || source.contains("Rails.application")
+            || source.contains("ActionController") || source.contains("ActionView")) {
           throw new IllegalArgumentException(label + " must not boot Rails");
         }
         if (source.contains("require_relative")) {
@@ -758,7 +884,13 @@ public final class SupervisorMain {
           maxGuestEntries.accumulateAndGet(entries, Math::max);
           try {
             Value value = invoke.execute(JSON.writeValueAsString(request));
-            JsonNode response = JSON.readTree(value.asString());
+            String encoded = value.asString();
+            if (encoded.length() > MAX_GUEST_RESPONSE
+                || encoded.getBytes(StandardCharsets.UTF_8).length > MAX_GUEST_RESPONSE) {
+              throw new IllegalStateException("guest response exceeds size limit");
+            }
+            JsonNode response = JSON.readTree(encoded);
+            validateGuestResponse(response);
             future.complete(withDiagnostics(response));
           } catch (Throwable error) {
             future.completeExceptionally(error);
@@ -779,6 +911,15 @@ public final class SupervisorMain {
 
     String evalForTest(String ruby) throws Exception {
       return owner.submit(() -> context.eval("ruby", ruby).asString()).get();
+    }
+
+    static void validateGuestResponse(JsonNode response) {
+      if (!(response instanceof ObjectNode object)
+          || !object.path("headers").isObject()
+          || !object.path("body").isTextual()
+          || object.path("headers").size() > MAX_RESPONSE_HEADERS) {
+        throw new IllegalStateException("guest response envelope is invalid");
+      }
     }
 
     JsonNode withDiagnostics(JsonNode response) {
@@ -892,7 +1033,13 @@ public final class SupervisorMain {
 
     Object call(Value... args) {
       try {
-        JsonNode request = JSON.readTree(args[0].asString());
+        if (args.length != 1) throw new IllegalArgumentException("host HTTP bridge expects one request envelope");
+        String encodedRequest = args[0].asString();
+        if (encodedRequest.length() > MAX_BODY
+            || encodedRequest.getBytes(StandardCharsets.UTF_8).length > MAX_BODY) {
+          throw new IllegalArgumentException("host HTTP bridge request too large");
+        }
+        JsonNode request = JSON.readTree(encodedRequest);
         String method = request.path("method").asText("GET").toUpperCase(Locale.ROOT);
         String path = request.path("path").asText();
         String query = query(request.path("query"));
@@ -913,8 +1060,14 @@ public final class SupervisorMain {
           bytes = input.readNBytes(MAX_BODY + 1);
         }
         if (bytes.length > MAX_BODY) throw new IllegalStateException("HTTP response too large");
-        return JSON.writeValueAsString(
-          JSON.createObjectNode().put("ok", true).put("status", response.statusCode()).put("body", new String(bytes, StandardCharsets.UTF_8)));
+        String responseBody = decodeUtf8Strict(bytes);
+        String encodedResponse = JSON.writeValueAsString(
+          JSON.createObjectNode().put("ok", true).put("status", response.statusCode()).put("body", responseBody));
+        if (encodedResponse.length() > MAX_BODY
+            || encodedResponse.getBytes(StandardCharsets.UTF_8).length > MAX_BODY) {
+          throw new IllegalStateException("host HTTP bridge response envelope too large");
+        }
+        return encodedResponse;
       } catch (Exception error) {
         System.err.println("host HTTP bridge failure: " + safe(error));
         try {
@@ -950,6 +1103,7 @@ public final class SupervisorMain {
         throw new IllegalArgumentException("HTTP base path escape");
       }
       if (!sameOrigin(base, target)) throw new IllegalArgumentException("HTTP origin escape");
+      if (target.toASCIIString().length() > MAX_BRIDGE_URL) throw new IllegalArgumentException("HTTP target too long");
       return target;
     }
 
