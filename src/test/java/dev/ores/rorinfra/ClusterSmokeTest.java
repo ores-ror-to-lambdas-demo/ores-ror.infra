@@ -24,7 +24,8 @@ final class ClusterSmokeTest {
 
     try (var cluster = new SupervisorMain.Cluster(settings)) {
       assertEquals(settings.unitCount(), cluster.contextCount());
-      assertEquals(settings.unitCount() * 3, cluster.workerCount());
+      assertEquals(settings.unitCount(), cluster.workerCount());
+      assertEquals(settings.unitCount() * 3, cluster.admissionCapacity());
 
       ExecutorService clients = Executors.newFixedThreadPool(18);
       Set<String> contextIds = ConcurrentHashMap.newKeySet();
@@ -52,8 +53,7 @@ final class ClusterSmokeTest {
           assertTrue(response.path("headers").path("x-ores-graal-isolate-key").asText().startsWith("route:"));
         }
         assertEquals(1, contextIds.size(), "one route must keep one Context across request volume");
-        assertTrue(workerThreads.size() >= 2, "one Context should be entered by multiple reusable host workers");
-        assertTrue(workerThreads.size() <= 3, "per-context workers must remain bounded");
+        assertEquals(1, workerThreads.size(), "each Context must remain pinned to one guest-owner thread");
         assertEquals(settings.unitCount(), cluster.contextCount(), "request volume must not create per-request Contexts");
         var health = cluster.cells.get("route:GET /healthz");
         assertEquals(1, health.maxConcurrentGuestEntries(), "TruffleRuby Context entry must be serialized");
@@ -92,28 +92,20 @@ final class ClusterSmokeTest {
     try (var cluster = new SupervisorMain.Cluster(SupervisorMain.Settings.test(root, "route", 1))) {
       var worker = cluster.cells.values().iterator().next();
 
-      String file = worker.context.eval(
-        "ruby",
-        "begin; File.read('/etc/passwd'); 'allowed'; rescue Exception => e; e.class.name; end"
-      ).asString();
+      String file = worker.evalForTest("begin; File.read('/etc/passwd'); 'allowed'; rescue Exception => e; e.class.name; end"
+      );
       assertNotEquals("allowed", file, "guest filesystem access must remain blocked");
 
-      String process = worker.context.eval(
-        "ruby",
-        "begin; system('true'); 'allowed'; rescue Exception => e; e.class.name; end"
-      ).asString();
+      String process = worker.evalForTest("begin; system('true'); 'allowed'; rescue Exception => e; e.class.name; end"
+      );
       assertNotEquals("allowed", process, "guest process creation must remain blocked");
 
-      String thread = worker.context.eval(
-        "ruby",
-        "begin; Thread.new { 1 }.join; 'allowed'; rescue Exception => e; e.class.name; end"
-      ).asString();
+      String thread = worker.evalForTest("begin; Thread.new { 1 }.join; 'allowed'; rescue Exception => e; e.class.name; end"
+      );
       assertNotEquals("allowed", thread, "guest-created threads must remain blocked");
 
-      String hostClass = worker.context.eval(
-        "ruby",
-        "begin; Java.type('java.lang.System'); 'allowed'; rescue Exception => e; e.class.name; end"
-      ).asString();
+      String hostClass = worker.evalForTest("begin; Java.type('java.lang.System'); 'allowed'; rescue Exception => e; e.class.name; end"
+      );
       assertNotEquals("allowed", hostClass, "host class lookup must remain blocked");
     }
   }
