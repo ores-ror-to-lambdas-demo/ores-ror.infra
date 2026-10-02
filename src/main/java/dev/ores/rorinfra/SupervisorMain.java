@@ -596,7 +596,6 @@ public final class SupervisorMain {
         .allowEnvironmentAccess(EnvironmentAccess.NONE)
         .allowIO(io)
         .allowPolyglotAccess(PolyglotAccess.NONE)
-        .option("ruby.cexts", "false")
         .build();
     }
 
