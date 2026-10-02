@@ -88,6 +88,7 @@ final class ClusterSmokeTest {
       "127.0.0.1",
       0,
       root,
+      "routes/healthz/_get/handler.rb",
       "http://127.0.0.1:9/v1",
       "",
       1,
@@ -146,23 +147,32 @@ final class ClusterSmokeTest {
   }
 
   @Test
-  void appFilesystemPredicateRejectsPathsOutsideAppRoot() throws Exception {
-    Path root = appRoot().toRealPath();
-    assertTrue(SupervisorMain.withinRoot(root, root.resolve("generated/lambda/entrypoint.rb")));
-    assertFalse(SupervisorMain.withinRoot(root, root.resolve("../outside").normalize()));
+  void graalUnitCannotEscapeGeneratedSourceRoot() {
+    Path root = appRoot().resolve("generated/graal").toAbsolutePath().normalize();
+    assertThrows(
+      IllegalArgumentException.class,
+      () -> SupervisorMain.Settings.resolveUnit(root, "../lambda/entrypoint.rb")
+    );
+    assertThrows(
+      IllegalArgumentException.class,
+      () -> SupervisorMain.Settings.resolveUnit(root, "/tmp/escape.rb")
+    );
   }
 
   @Test
-  void settingsRequireGeneratedLambdaArtifactNotRailsBootFiles(@TempDir Path temp) throws Exception {
-    Files.createDirectories(temp.resolve("graal"));
-    Files.createDirectories(temp.resolve("generated/lambda"));
-    Files.writeString(temp.resolve("graal/bootstrap.rb"), "# generated test bootstrap\n");
-    Files.writeString(temp.resolve("generated/lambda/entrypoint.rb"), "# generated test entrypoint\n");
+  void settingsRequireGeneratedGraalSourcesNotRailsBootFiles(@TempDir Path temp) throws Exception {
+    Files.createDirectories(temp.resolve("generated/graal/routes/healthz/_get"));
+    Files.writeString(temp.resolve("generated/graal/common.rb"), "# generated common\n");
+    Files.writeString(
+      temp.resolve("generated/graal/routes/healthz/_get/handler.rb"),
+      "# generated unit\n"
+    );
 
     var settings = new SupervisorMain.Settings(
       "127.0.0.1",
       0,
       temp,
+      "routes/healthz/_get/handler.rb",
       "http://127.0.0.1:9/v1",
       "",
       1,
@@ -176,6 +186,8 @@ final class ClusterSmokeTest {
 
     assertFalse(Files.exists(temp.resolve("config/environment.rb")));
     assertEquals(temp.toAbsolutePath().normalize(), settings.appRoot);
+    assertTrue(settings.commonSourcePath.startsWith(temp.resolve("generated/graal").toAbsolutePath().normalize()));
+    assertTrue(settings.unitSourcePath.startsWith(temp.resolve("generated/graal").toAbsolutePath().normalize()));
   }
 
   private static Path appRoot() {
