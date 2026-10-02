@@ -407,12 +407,9 @@ public final class SupervisorMain {
       for (UnitDef unit : settings.units.values()) {
         unitSources.put(unit.key, source(unit.unitSource, unit.unitPath.getFileName().toString() + "-" + safeName(unit.key)));
       }
-      try {
-        for (UnitDef unit : settings.units.values()) cells.put(unit.key, create(unit));
-      } catch (Throwable error) {
-        close();
-        throw error;
-      }
+      // Isolates are created lazily on first matching request. This avoids
+      // eagerly booting one TruffleRuby Context for every route/group and keeps
+      // idle units at zero cost until they receive traffic.
       maintenance.scheduleAtFixedRate(this::maintainSafe, 1, 1, TimeUnit.SECONDS);
     }
 
