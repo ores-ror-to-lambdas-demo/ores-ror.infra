@@ -49,11 +49,10 @@ Each `GraalWorker` owns:
 
 - exactly one long-lived TruffleRuby `Context`;
 - the cached generated common/unit sources for its route or group;
-- a bounded host executor of up to 5 reusable worker threads entering that same Context;
-- one fair per-isolate admission bound equal to the configured Context thread-pool size;
+- one fair per-isolate admission semaphore;
 - explicit per-request envelopes; thread identity is diagnostic only.
 
-Embedded TruffleRuby normally enables single-threaded mode, so the supervisor explicitly sets `ruby.single-threaded=false`. `CONTEXT_THREAD_POOL_SIZE` is the primary setting and is bounded to 1–5, default 5; older admission/concurrency names remain compatibility aliases. A request occupies one executor worker while it enters guest Ruby, but request identity is not thread identity. Invocation boundaries snapshot and restore Ruby fiber/thread-local state before worker reuse. A hard timeout intentionally replaces the affected Context/isolate, so other requests currently executing in that Context may be cancelled too; graceful max-age/idle retirement creates replacement capacity before draining the old isolate. Graal execution remains Rails-free: no `Rails.application`, Action Controller, or Action View is loaded in the guest runtime.
+The `Cluster` owns one bounded process-wide host execution pool shared by every `GraalWorker`. `GRAAL_THREAD_POOL_SIZE` defaults to 32 and controls total host execution threads for the process. `ISOLATE_MAX_CONCURRENCY` defaults to 5 and independently caps admitted work per worker/context; older Context concurrency names remain compatibility aliases. Embedded TruffleRuby explicitly sets `ruby.single-threaded=false`, allowing different shared pool threads to enter a Context while guest-created Ruby threads remain disabled. A host thread has no permanent worker affinity and may execute in public/private/admin or dedicated workers sequentially. Invocation boundaries snapshot and restore Ruby fiber/thread-local state before worker reuse. A hard timeout intentionally replaces the affected Context/isolate, so other requests currently executing in that Context may be cancelled too; graceful max-age/idle retirement creates replacement capacity before draining the old isolate. Graal execution remains Rails-free: no `Rails.application`, Action Controller, or Action View is loaded in the guest runtime.
 
 
 ### Native-access boundary

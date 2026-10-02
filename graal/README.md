@@ -7,9 +7,11 @@ The runtime is Rails-free and does not initialize `Rails.application`.
 - one host OS process may own one shared Graal engine;
 - every concrete route gets exactly one long-lived Ruby context/isolate;
 - every route group gets exactly one long-lived Ruby context/isolate;
-- each context is entered by a bounded host executor of up to 5 reusable threads;
+- all contexts share one bounded process-wide host execution pool;
+- `GRAAL_THREAD_POOL_SIZE` controls total host threads independently of worker count;
+- each worker/context separately enforces `ISOLATE_MAX_CONCURRENCY`;
 - embedded TruffleRuby explicitly uses `ruby.single-threaded=false`, while guest-created threads remain disabled;
-- a worker is a host execution thread entering a context, not another OS process or another context;
+- a `GraalWorker` is a runtime/isolation cell, not a host thread; shared host threads have no permanent worker affinity;
 - mutable Ruby state is context-local while compiled/source material may be shared read-only by the engine;
 - guest-created threads, filesystem access, child processes, raw sockets, and native FFI remain disabled;
 - data access uses the host HTTP capability.

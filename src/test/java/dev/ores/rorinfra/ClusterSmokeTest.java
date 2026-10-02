@@ -20,6 +20,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import org.junit.jupiter.api.Test;
 
 final class ClusterSmokeTest {
@@ -48,8 +49,10 @@ final class ClusterSmokeTest {
       }
 
       assertEquals(1, contextIds.size(), "one route must keep one Context across request volume");
-      assertTrue(workerThreads.size() > 1, "one Context should be entered by multiple reusable host workers");
-      assertTrue(workerThreads.size() <= 5, "Context worker pool must remain bounded at five threads");
+      assertFalse(workerThreads.isEmpty());
+      assertTrue(workerThreads.size() <= cluster.sharedThreadPoolSize(), "host threads must come from the bounded process-wide pool");
+      assertEquals(8, cluster.sharedThreadPoolSize());
+      assertTrue(cluster.largestSharedThreadPoolSize() <= 8);
       assertEquals(1, cluster.contextCount(), "one requested route should own one long-lived Context");
       assertEquals(1, cluster.workerCount());
       assertEquals(5, cluster.admissionCapacity());
@@ -76,6 +79,123 @@ final class ClusterSmokeTest {
         assertTrue(rubyThreadIds.size() <= 5);
       } finally {
         parallel.shutdownNow();
+      }
+    }
+  }
+
+  @Test
+  void oneProcessWideHostThreadCanEnterMultipleDistinctWorkers() throws Exception {
+    Path root = Path.of(System.getProperty("app.root")).toAbsolutePath().normalize();
+    var placement = new SupervisorMain.WorkerPlacement("route", "lazy", java.util.Map.of(), java.util.Map.of());
+    var settings = SupervisorMain.Settings.test(root, placement, 1, 1);
+
+    try (var cluster = new SupervisorMain.Cluster(settings)) {
+      var healthRoute = settings.resolveRoute("GET", "/healthz");
+      var ordersRoute = settings.resolveRoute("GET", "/orders/demo");
+      assertTrue(healthRoute != null && ordersRoute != null);
+
+      var health = cluster.create(settings.unitFor(healthRoute));
+      var orders = cluster.create(settings.unitFor(ordersRoute));
+      try {
+        assertNotEquals(health.contextId, orders.contextId);
+        String healthThread = health.hostThreadNameForTest();
+        String ordersThread = orders.hostThreadNameForTest();
+        assertEquals(healthThread, ordersThread, "the same process-wide host thread should be reusable across distinct Contexts");
+        assertTrue(healthThread.startsWith("graal-guest-"));
+        assertEquals(1, cluster.sharedThreadPoolSize());
+        assertEquals(1, cluster.largestSharedThreadPoolSize());
+      } finally {
+        health.close();
+        orders.close();
+      }
+    }
+  }
+
+  @Test
+  void sequentialGuestEntriesReleaseAdmissionBeforeCompletionIsObserved() throws Exception {
+    Path root = Path.of(System.getProperty("app.root")).toAbsolutePath().normalize();
+    var placement = new SupervisorMain.WorkerPlacement("route", "lazy", java.util.Map.of(), java.util.Map.of());
+    var settings = SupervisorMain.Settings.test(root, placement, 1, 4);
+
+    try (var cluster = new SupervisorMain.Cluster(settings)) {
+      var healthRoute = settings.resolveRoute("GET", "/healthz");
+      var health = cluster.create(settings.unitFor(healthRoute));
+      try {
+        for (int i = 0; i < 100; i++) {
+          assertEquals(Integer.toString(i), health.evalForTest(i + ".to_s"));
+        }
+        assertEquals(0, health.load());
+      } finally {
+        health.close();
+      }
+    }
+  }
+
+  @Test
+  void closedClusterRejectsNewInvocationsAndDoesNotRecreateWorkers() throws Exception {
+    Path root = Path.of(System.getProperty("app.root")).toAbsolutePath().normalize();
+    var settings = SupervisorMain.Settings.test(root, "route", 1);
+    var cluster = new SupervisorMain.Cluster(settings);
+
+    JsonNode first = cluster.invoke(request("before-close", "GET", "/healthz"));
+    assertEquals(200, first.path("status").asInt());
+    assertEquals(1, cluster.workerCount());
+
+    cluster.close();
+    assertEquals(0, cluster.workerCount());
+    assertThrows(
+      RejectedExecutionException.class,
+      () -> cluster.invoke(request("after-close", "GET", "/healthz"))
+    );
+    assertEquals(0, cluster.workerCount(), "closed cluster must not lazily recreate a worker");
+  }
+
+  @Test
+  void hardCancellingOneWorkerDoesNotShutdownSharedPoolOrOtherWorkers() throws Exception {
+    Path root = Path.of(System.getProperty("app.root")).toAbsolutePath().normalize();
+    var placement = new SupervisorMain.WorkerPlacement("route", "lazy", java.util.Map.of(), java.util.Map.of());
+    var settings = SupervisorMain.Settings.test(root, placement, 1, 1);
+
+    try (var cluster = new SupervisorMain.Cluster(settings)) {
+      var healthRoute = settings.resolveRoute("GET", "/healthz");
+      var ordersRoute = settings.resolveRoute("GET", "/orders/demo");
+      var health = cluster.create(settings.unitFor(healthRoute));
+      var orders = cluster.create(settings.unitFor(ordersRoute));
+      try {
+        assertEquals("1", orders.evalForTest("1.to_s"));
+        health.hardCancel("test cancellation");
+        assertTrue(health.closed());
+        assertFalse(cluster.guestExecutor.isShutdown(), "worker cancellation must not own or stop the process-wide pool");
+        assertEquals("2", orders.evalForTest("2.to_s"), "unrelated worker must remain usable after another worker is cancelled");
+      } finally {
+        if (!health.closed()) health.close();
+        if (!orders.closed()) orders.close();
+      }
+    }
+  }
+
+  @Test
+  void perIsolateAdmissionRemainsBoundedOnLargerSharedPool() throws Exception {
+    Path root = Path.of(System.getProperty("app.root")).toAbsolutePath().normalize();
+    var placement = new SupervisorMain.WorkerPlacement("route", "lazy", java.util.Map.of(), java.util.Map.of());
+    var settings = SupervisorMain.Settings.test(root, placement, 2, 8);
+
+    try (var cluster = new SupervisorMain.Cluster(settings)) {
+      var healthRoute = settings.resolveRoute("GET", "/healthz");
+      var health = cluster.create(settings.unitFor(healthRoute));
+      try {
+        var first = health.evalForTestAsync("sleep 0.1; 'first'");
+        var second = health.evalForTestAsync("sleep 0.1; 'second'");
+        assertThrows(
+          RejectedExecutionException.class,
+          () -> health.evalForTestAsync("'third'")
+        );
+        assertEquals("first", first.get());
+        assertEquals("second", second.get());
+        assertEquals(2, health.maxConcurrentGuestEntries());
+        assertTrue(cluster.largestSharedThreadPoolSize() <= 8);
+      } finally {
+        health.close();
       }
     }
   }
@@ -272,12 +392,16 @@ final class ClusterSmokeTest {
     wrongApplication.put("application", "other-app");
     assertThrows(IllegalArgumentException.class, () -> settings.validateManifest(wrongApplication));
 
-    ObjectNode wrongPoolSize = manifest.deepCopy();
-    wrongPoolSize.put("host_thread_pool_size_per_context", 4);
-    assertThrows(IllegalArgumentException.class, () -> settings.validateManifest(wrongPoolSize));
+    ObjectNode wrongPoolScope = manifest.deepCopy();
+    wrongPoolScope.put("host_thread_pool_scope", "per-context");
+    assertThrows(IllegalArgumentException.class, () -> settings.validateManifest(wrongPoolScope));
+
+    ObjectNode noCrossIsolateReuse = manifest.deepCopy();
+    noCrossIsolateReuse.put("host_threads_reused_across_isolates", false);
+    assertThrows(IllegalArgumentException.class, () -> settings.validateManifest(noCrossIsolateReuse));
 
     ObjectNode wrongUnitPool = manifest.deepCopy();
-    ((ObjectNode) wrongUnitPool.withArray("isolate_units").get(0)).put("host_thread_pool_size", 4);
+    ((ObjectNode) wrongUnitPool.withArray("isolate_units").get(0)).put("host_thread_pool_scope", "per-context");
     assertThrows(IllegalArgumentException.class, () -> settings.parseUnits(wrongUnitPool));
 
     ObjectNode wrongSharedSource = manifest.deepCopy();
