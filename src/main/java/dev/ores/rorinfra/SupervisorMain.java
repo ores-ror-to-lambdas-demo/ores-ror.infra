@@ -275,10 +275,10 @@ public final class SupervisorMain {
     }
 
     static WorkerPlacement fromEnv(Path appRoot) {
-      String configured = env("GRAAL_WORKER_PLACEMENT_FILE", "").trim();
+      String configured = Settings.env("GRAAL_WORKER_PLACEMENT_FILE", "").trim();
       if (configured.isEmpty()) {
-        String legacy = env("GRAAL_WORKER_PLACEMENT", env("ISOLATION_GRANULARITY", "route")).toLowerCase(Locale.ROOT);
-        String startup = env("GRAAL_WORKER_STARTUP", "lazy").toLowerCase(Locale.ROOT);
+        String legacy = Settings.env("GRAAL_WORKER_PLACEMENT", Settings.env("ISOLATION_GRANULARITY", "route")).toLowerCase(Locale.ROOT);
+        String startup = Settings.env("GRAAL_WORKER_STARTUP", "lazy").toLowerCase(Locale.ROOT);
         return new WorkerPlacement(legacy, startup, Map.of(), Map.of());
       }
 
