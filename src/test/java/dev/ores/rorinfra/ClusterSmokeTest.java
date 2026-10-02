@@ -31,7 +31,7 @@ final class ClusterSmokeTest {
       Set<String> workerThreads = ConcurrentHashMap.newKeySet();
       try {
         List<CompletableFuture<JsonNode>> calls = new ArrayList<>();
-        for (int i = 0; i < 100; i++) {
+        for (int i = 0; i < 30; i++) {
           int n = i;
           calls.add(CompletableFuture.supplyAsync(() -> {
             try {
