@@ -348,7 +348,7 @@ public final class SupervisorMain {
         env("ISOLATION_GRANULARITY", "route").toLowerCase(),
         env("DATA_API_URL", "http://127.0.0.1:8787/v1"),
         env("DATA_API_TOKEN", ""),
-        integerAliases("CONTEXT_ADMISSION_LIMIT", List.of("CONTEXT_MAX_CONCURRENCY", "ISOLATE_MAX_CONCURRENCY"), 5, 1, 5),
+        integerAliases("CONTEXT_THREAD_POOL_SIZE", List.of("CONTEXT_ADMISSION_LIMIT", "CONTEXT_MAX_CONCURRENCY", "ISOLATE_MAX_CONCURRENCY"), 5, 1, 5),
         1000L * integerAlias("CONTEXT_MAX_AGE_SECONDS", "ISOLATE_MAX_AGE_SECONDS", 1800, 60, 1800),
         1000L * integerAlias("CONTEXT_IDLE_SECONDS", "ISOLATE_IDLE_SECONDS", 300, 30, 300),
         1000L * integerAlias("CONTEXT_DRAIN_SECONDS", "ISOLATE_DRAIN_SECONDS", 30, 1, 300),
