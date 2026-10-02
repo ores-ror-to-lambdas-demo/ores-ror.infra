@@ -58,4 +58,4 @@ Many HTTP requests may arrive concurrently, but each GraalWorker pins its Truffl
 
 ### Native-access boundary
 
-TruffleRuby 34 currently requires Polyglot native access even during core startup (for POSIX-backed environment/gem-path resolution). Consequently, `GraalWorker` does not claim that `IOAccess` alone prevents Ruby-native filesystem syscalls. Production tenant isolation must pair the Graal restrictions with an OS/container filesystem sandbox. The Ruby Native Isolate target remains fail-closed until upstream provides the required isolate artifact.
+TruffleRuby 34 currently requires Polyglot native access even during core startup (for POSIX-backed environment/gem-path resolution). Consequently, `GraalWorker` does not claim that `IOAccess` alone prevents Ruby-native filesystem syscalls. Production tenant isolation must pair the Graal restrictions with an OS/container filesystem/process sandbox. The Ruby Native Isolate target remains fail-closed until upstream provides the required isolate artifact.
