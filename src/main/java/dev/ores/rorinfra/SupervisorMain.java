@@ -273,7 +273,7 @@ public final class SupervisorMain {
         1_800_000,
         300_000,
         5_000,
-        15_000);
+        120_000);
     }
 
     int unitCount() {
