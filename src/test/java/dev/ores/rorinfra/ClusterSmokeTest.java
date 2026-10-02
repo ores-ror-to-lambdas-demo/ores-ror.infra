@@ -96,6 +96,14 @@ final class ClusterSmokeTest {
       String hostClass = worker.evalForTest("begin; Java.type('java.lang.System'); 'allowed'; rescue Exception => e; e.class.name; end"
       );
       assertNotEquals("allowed", hostClass, "host class lookup must remain blocked");
+
+      String fileRead = worker.evalForTest("begin; File.read('/etc/passwd'); 'allowed'; rescue Exception => e; e.class.name; end"
+      );
+      assertNotEquals("allowed", fileRead, "guest filesystem reads must remain blocked");
+
+      String process = worker.evalForTest("begin; Process.spawn('true'); 'allowed'; rescue Exception => e; e.class.name; end"
+      );
+      assertNotEquals("allowed", process, "guest process creation must remain blocked");
     }
   }
 
