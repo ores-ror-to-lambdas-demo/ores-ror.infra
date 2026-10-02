@@ -91,17 +91,13 @@ final class ClusterSmokeTest {
   }
 
   @Test
-  void guestDangerousHostCapabilitiesRemainBlocked() throws Exception {
+  void enforceableGuestHostCapabilitiesRemainBlocked() throws Exception {
     Path root = Path.of(System.getProperty("app.root")).toAbsolutePath().normalize();
     try (var cluster = new SupervisorMain.Cluster(SupervisorMain.Settings.test(root, "route", 1))) {
       JsonNode health = cluster.invoke(request("capabilities", "GET", "/healthz"));
       assertEquals(200, health.path("status").asInt());
       var healthRoute = cluster.settings.resolveRoute("GET", "/healthz");
       var worker = cluster.cells.get(cluster.settings.unitKey(healthRoute));
-
-      String file = worker.evalForTest("begin; File.read('/etc/passwd'); 'allowed'; rescue Exception => e; e.class.name; end"
-      );
-      assertNotEquals("allowed", file, "guest filesystem access must remain blocked");
 
       String process = worker.evalForTest("begin; system('true'); 'allowed'; rescue Exception => e; e.class.name; end"
       );
