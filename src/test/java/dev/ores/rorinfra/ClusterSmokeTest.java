@@ -81,6 +81,53 @@ final class ClusterSmokeTest {
   }
 
   @Test
+  void mixedWorkerPlacementSharesOnlyExplicitlyCompatibleRoutes() throws Exception {
+    Path root = Path.of(System.getProperty("app.root")).toAbsolutePath().normalize();
+    var placement = new SupervisorMain.WorkerPlacement(
+      "route",
+      "lazy",
+      java.util.Map.of(),
+      java.util.Map.of(
+        "GET /orders/:id", "group:orders",
+        "POST /orders/:id/cancel", "group:orders"
+      )
+    );
+    var settings = SupervisorMain.Settings.test(root, placement, 2);
+
+    try (var cluster = new SupervisorMain.Cluster(settings)) {
+      assertEquals(0, cluster.workerCount(), "lazy placement must not pre-create workers");
+
+      JsonNode show = cluster.invoke(request("mixed-show", "GET", "/orders/demo"));
+      JsonNode cancel = cluster.invoke(request("mixed-cancel", "POST", "/orders/demo/cancel"));
+      String showContext = show.path("headers").path("x-ores-graal-context-id").asText();
+      String cancelContext = cancel.path("headers").path("x-ores-graal-context-id").asText();
+      assertEquals(showContext, cancelContext, "explicitly assigned routes should share the selected generated worker unit");
+      assertEquals(1, cluster.workerCount());
+
+      JsonNode health = cluster.invoke(request("mixed-health", "GET", "/healthz"));
+      String healthContext = health.path("headers").path("x-ores-graal-context-id").asText();
+      assertNotEquals(showContext, healthContext, "unassigned routes keep the safe per-handler worker default");
+      assertEquals(2, cluster.workerCount());
+    }
+  }
+
+  @Test
+  void workerPlacementRejectsUnitsThatDoNotContainTheSelectedRoute() throws Exception {
+    Path root = Path.of(System.getProperty("app.root")).toAbsolutePath().normalize();
+    var placement = new SupervisorMain.WorkerPlacement(
+      "route",
+      "lazy",
+      java.util.Map.of(),
+      java.util.Map.of("GET /healthz", "group:orders")
+    );
+
+    assertThrows(
+      IllegalArgumentException.class,
+      () -> SupervisorMain.Settings.test(root, placement, 1)
+    );
+  }
+
+  @Test
   void routeAndGroupGranularityHaveExpectedIsolationBoundaries() throws Exception {
     Path root = Path.of(System.getProperty("app.root")).toAbsolutePath().normalize();
 
