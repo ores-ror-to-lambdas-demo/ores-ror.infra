@@ -518,6 +518,14 @@ public final class SupervisorMain {
         }
       }
       for (RouteDef route : routes) {
+        String identity = route.verb + " " + route.path;
+        String byId = placement.routeAssignments.get(route.routeId);
+        String byIdentity = placement.routeIdentityAssignments.get(identity);
+        if (byId != null && byIdentity != null && !byId.equals(byIdentity)) {
+          throw new IllegalArgumentException(
+            "worker placement has conflicting assignments for " + route.routeId + " / " + identity);
+        }
+
         String key = placement.unitKey(route);
         UnitDef unit = units.get(key);
         if (unit == null) {
