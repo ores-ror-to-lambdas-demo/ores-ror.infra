@@ -1,11 +1,14 @@
 package dev.ores.rorinfra;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import java.net.URI;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -122,6 +125,49 @@ final class ClusterSmokeTest {
       assertEquals(404, response.path("status").asInt());
       assertEquals(before, cluster.contextCount());
     }
+  }
+
+  @Test
+  void hostHttpBridgeCannotEscapeConfiguredOriginOrBasePath() throws Exception {
+    URI base = URI.create("https://data.example.test/v1/");
+
+    URI target = SupervisorMain.HttpBridge.targetUri(base, "GET", "/users/abc", "a=1");
+    assertEquals("https://data.example.test/v1/users/abc?a=1", target.toString());
+
+    assertThrows(
+      IllegalArgumentException.class,
+      () -> SupervisorMain.HttpBridge.targetUri(base, "TRACE", "/users/abc", "")
+    );
+    assertThrows(
+      IllegalArgumentException.class,
+      () -> SupervisorMain.HttpBridge.targetUri(base, "GET", "/../admin", "")
+    );
+    assertThrows(
+      IllegalArgumentException.class,
+      () -> SupervisorMain.HttpBridge.targetUri(base, "GET", "/%2e%2e/admin", "")
+    );
+    assertThrows(
+      IllegalArgumentException.class,
+      () -> SupervisorMain.HttpBridge.targetUri(base, "GET", "//evil.example/path", "")
+    );
+  }
+
+  @Test
+  void responseHeadersRejectHopByHopInjectionAndOversizedValues() {
+    assertTrue(SupervisorMain.safeResponseHeader("content-type", "application/json"));
+    assertFalse(SupervisorMain.safeResponseHeader("content-length", "42"));
+    assertFalse(SupervisorMain.safeResponseHeader("transfer-encoding", "chunked"));
+    assertFalse(SupervisorMain.safeResponseHeader("x-test", "ok\r\ninjected: true"));
+    assertFalse(SupervisorMain.safeResponseHeader("bad header", "x"));
+    assertFalse(SupervisorMain.safeResponseHeader("x-test", "a".repeat(8193)));
+  }
+
+  @Test
+  void tokenOverCleartextIsOnlyAllowedForLoopbackDataApi() {
+    assertTrue(SupervisorMain.isLoopbackHost("localhost"));
+    assertTrue(SupervisorMain.isLoopbackHost("127.0.0.1"));
+    assertTrue(SupervisorMain.isLoopbackHost("::1"));
+    assertFalse(SupervisorMain.isLoopbackHost("data.example.test"));
   }
 
   static ObjectNode request(String id, String method, String path) {
