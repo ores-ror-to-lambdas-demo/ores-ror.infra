@@ -854,6 +854,7 @@ public final class SupervisorMain {
       return Context.newBuilder("ruby")
         .engine(engine)
         .allowExperimentalOptions(true)
+        .option("ruby.single-threaded", "false")
         .option("ruby.platform-native", "false")
         .option("ruby.cexts", "false")
         .option("ruby.rubygems", "false")
