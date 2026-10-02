@@ -20,7 +20,7 @@ jobs:
         with:
           persist-credentials: false
           repository: ores-ror-to-lambdas-demo/ores-ror.rb
-          ref: 09336b59f07332af995e9b586bac10cd4242df2b
+          ref: d3a90920ca5ab0639551c40dde18b44889027352
           path: app
       - uses: ruby/setup-ruby@14594264cd68ce8a2345dd349bc3d138a4ef85c8
         with:
@@ -124,7 +124,7 @@ jobs:
         with:
           persist-credentials: false
           repository: ores-ror-to-lambdas-demo/ores-ror.rb
-          ref: 09336b59f07332af995e9b586bac10cd4242df2b
+          ref: d3a90920ca5ab0639551c40dde18b44889027352
           path: app
       - uses: ruby/setup-ruby@14594264cd68ce8a2345dd349bc3d138a4ef85c8
         with:
