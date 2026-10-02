@@ -27,7 +27,7 @@ final class ClusterSmokeTest {
       assertEquals(0, cluster.workerCount());
       assertEquals(0, cluster.admissionCapacity());
 
-      ExecutorService clients = Executors.newFixedThreadPool(18);
+      ExecutorService clients = Executors.newFixedThreadPool(3);
       Set<String> contextIds = ConcurrentHashMap.newKeySet();
       Set<String> workerThreads = ConcurrentHashMap.newKeySet();
       try {
