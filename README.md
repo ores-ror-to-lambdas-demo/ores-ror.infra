@@ -63,3 +63,34 @@ The portable guest runtime is deliberately pure Ruby: generated Graal units do n
 That is an in-process capability boundary, not a substitute for tenant OS isolation. Production still layers the worker inside an OS/container sandbox, and the separate Ruby Polyglot Native Isolate target remains fail-closed until the upstream Ruby isolate artifact exists and is independently validated.
 
 Runtime diagnostic headers are disabled by default and may be enabled only with `EXPOSE_GRAAL_DIAGNOSTICS=true` for trusted debugging.
+
+
+## Configurable GraalWorker placement
+
+`GraalWorker` is a runtime/isolation cell, not inherently a 1:1 synonym for a Lambda handler. The safe default remains one worker per generated route unit.
+
+End users can override placement with `GRAAL_WORKER_PLACEMENT_FILE`. The file uses the `ores-graal-worker-placement/v1` contract documented by `graal/worker-placement.schema.json`.
+
+Example:
+
+```json
+{
+  "schema": "ores-graal-worker-placement/v1",
+  "default_strategy": "route",
+  "startup": "lazy",
+  "route_identity_assignments": {
+    "GET /orders/:id": "group:orders",
+    "GET /orders/:id/receipt": "group:orders",
+    "POST /orders/:id/cancel": "group:orders"
+  }
+}
+```
+
+This means:
+
+- unmatched routes keep a dedicated route worker;
+- the selected order routes share the already-generated `group:orders` worker/context;
+- `lazy` creates a worker on first use; `eager` prewarms every distinct selected unit;
+- configuration fails closed if a route selects a generated unit that does not actually contain that route.
+
+The placement contract intentionally references generated unit keys rather than hard-coding route/group behavior into `GraalWorker`. That leaves room for future generated units such as `domain:public`, `domain:private`, and `domain:admin` without changing the worker lifecycle API.
