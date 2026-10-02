@@ -112,6 +112,26 @@ final class ClusterSmokeTest {
   }
 
   @Test
+  void sequentialGuestEntriesReleaseAdmissionBeforeCompletionIsObserved() throws Exception {
+    Path root = Path.of(System.getProperty("app.root")).toAbsolutePath().normalize();
+    var placement = new SupervisorMain.WorkerPlacement("route", "lazy", java.util.Map.of(), java.util.Map.of());
+    var settings = SupervisorMain.Settings.test(root, placement, 1, 4);
+
+    try (var cluster = new SupervisorMain.Cluster(settings)) {
+      var healthRoute = settings.resolveRoute("GET", "/healthz");
+      var health = cluster.create(settings.unitFor(healthRoute));
+      try {
+        for (int i = 0; i < 100; i++) {
+          assertEquals(Integer.toString(i), health.evalForTest(i + ".to_s"));
+        }
+        assertEquals(0, health.load());
+      } finally {
+        health.close();
+      }
+    }
+  }
+
+  @Test
   void hardCancellingOneWorkerDoesNotShutdownSharedPoolOrOtherWorkers() throws Exception {
     Path root = Path.of(System.getProperty("app.root")).toAbsolutePath().normalize();
     var placement = new SupervisorMain.WorkerPlacement("route", "lazy", java.util.Map.of(), java.util.Map.of());
