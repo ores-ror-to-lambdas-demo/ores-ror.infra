@@ -26,7 +26,7 @@ final class ClusterSmokeTest {
   @Test
   void routeGranularityUsesOneLongLivedContextWithBoundedAdmission() throws Exception {
     Path root = Path.of(System.getProperty("app.root")).toAbsolutePath().normalize();
-    var settings = SupervisorMain.Settings.test(root, "route", 3);
+    var settings = SupervisorMain.Settings.test(root, "route", 5);
 
     try (var cluster = new SupervisorMain.Cluster(settings)) {
       assertEquals(0, cluster.contextCount());
@@ -48,13 +48,35 @@ final class ClusterSmokeTest {
       }
 
       assertEquals(1, contextIds.size(), "one route must keep one Context across request volume");
-      assertEquals(1, workerThreads.size(), "each Context must remain pinned to one guest-owner thread");
+      assertTrue(workerThreads.size() > 1, "one Context should be entered by multiple reusable host workers");
+      assertTrue(workerThreads.size() <= 5, "Context worker pool must remain bounded at five threads");
       assertEquals(1, cluster.contextCount(), "one requested route should own one long-lived Context");
       assertEquals(1, cluster.workerCount());
-      assertEquals(3, cluster.admissionCapacity());
+      assertEquals(5, cluster.admissionCapacity());
       var healthRoute = settings.resolveRoute("GET", "/healthz");
       var health = cluster.cells.get(settings.unitKey(healthRoute));
-      assertEquals(1, health.maxConcurrentGuestEntries(), "TruffleRuby Context entry must be serialized");
+      assertTrue(health.maxConcurrentGuestEntries() >= 1);
+      assertTrue(health.maxConcurrentGuestEntries() <= 5, "one Context must never exceed five concurrent guest entries");
+
+      ExecutorService parallel = Executors.newFixedThreadPool(5);
+      try {
+        Set<String> rubyThreadIds = ConcurrentHashMap.newKeySet();
+        List<CompletableFuture<Void>> entries = new ArrayList<>();
+        for (int i = 0; i < 5; i++) {
+          entries.add(CompletableFuture.runAsync(() -> {
+            try {
+              rubyThreadIds.add(health.evalForTest("sleep 0.05; Thread.current.object_id.to_s"));
+            } catch (Exception error) {
+              throw new RuntimeException(error);
+            }
+          }, parallel));
+        }
+        for (var entry : entries) entry.get();
+        assertTrue(rubyThreadIds.size() > 1, "shared Context must support entry from multiple host threads");
+        assertTrue(rubyThreadIds.size() <= 5);
+      } finally {
+        parallel.shutdownNow();
+      }
     }
   }
 
