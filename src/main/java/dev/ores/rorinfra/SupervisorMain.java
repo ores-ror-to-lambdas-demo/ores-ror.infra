@@ -421,6 +421,7 @@ public final class SupervisorMain {
         this.commonSource = readRubySource(commonPath, "shared Graal source");
         this.routes = parseRoutes(manifest);
         this.units = parseUnits(manifest);
+        validateUnitDefinitions();
         validatePlacement();
       } catch (IOException error) {
         throw new IllegalArgumentException("cannot read generated Graal manifest: " + this.manifestPath, error);
@@ -646,7 +647,7 @@ public final class SupervisorMain {
       return Map.copyOf(parsed);
     }
 
-    void validateUnitCoverage(Map<String, UnitDef> parsed, String selectedKind) {
+    void validateUnitDefinitions() {
       Map<String, RouteDef> byId = new HashMap<>();
       Map<String, List<RouteDef>> byGroup = new HashMap<>();
       for (RouteDef route : routes) {
@@ -654,33 +655,38 @@ public final class SupervisorMain {
         byGroup.computeIfAbsent(route.group, ignored -> new ArrayList<>()).add(route);
       }
 
-      Set<String> covered = new java.util.HashSet<>();
-      for (UnitDef unit : parsed.values()) {
-        if ("route".equals(selectedKind)) {
-          if (unit.routeIds.size() != 1) throw new IllegalArgumentException("route isolate must contain exactly one route: " + unit.key);
+      for (UnitDef unit : units.values()) {
+        Set<String> ids = new java.util.HashSet<>(unit.routeIds);
+        if (ids.size() != unit.routeIds.size()) {
+          throw new IllegalArgumentException("isolate unit contains duplicate route_ids: " + unit.key);
+        }
+        for (String id : ids) {
+          if (!byId.containsKey(id)) {
+            throw new IllegalArgumentException("isolate unit references unknown route_id " + id + ": " + unit.key);
+          }
+        }
+
+        if ("route".equals(unit.kind)) {
+          if (unit.routeIds.size() != 1) {
+            throw new IllegalArgumentException("route isolate must contain exactly one route: " + unit.key);
+          }
           RouteDef route = byId.get(unit.routeIds.get(0));
-          if (route == null || !unit.key.equals("route:" + route.routeId) || !unit.group.equals(route.group)) {
+          if (!unit.key.equals("route:" + route.routeId) || !unit.group.equals(route.group)) {
             throw new IllegalArgumentException("route isolate does not match route metadata: " + unit.key);
           }
-          if (!covered.add(route.routeId)) throw new IllegalArgumentException("route is covered by multiple isolate units: " + route.routeId);
-        } else {
+        } else if ("group".equals(unit.kind)) {
           List<RouteDef> expected = byGroup.get(unit.group);
           if (expected == null || !unit.key.equals("group:" + unit.group)) {
             throw new IllegalArgumentException("group isolate does not match route metadata: " + unit.key);
           }
           Set<String> expectedIds = new java.util.HashSet<>();
           expected.forEach(route -> expectedIds.add(route.routeId));
-          Set<String> actualIds = new java.util.HashSet<>(unit.routeIds);
-          if (actualIds.size() != unit.routeIds.size() || !actualIds.equals(expectedIds)) {
+          if (!ids.equals(expectedIds)) {
             throw new IllegalArgumentException("group isolate route_ids do not exactly match group routes: " + unit.key);
           }
-          for (String routeId : actualIds) {
-            if (!covered.add(routeId)) throw new IllegalArgumentException("route is covered by multiple isolate units: " + routeId);
-          }
+        } else if (!unit.key.startsWith(unit.kind + ":")) {
+          throw new IllegalArgumentException("custom isolate unit key must be namespaced by kind: " + unit.key);
         }
-      }
-      if (covered.size() != routes.size()) {
-        throw new IllegalArgumentException("selected isolate units do not cover every route exactly once");
       }
     }
 
