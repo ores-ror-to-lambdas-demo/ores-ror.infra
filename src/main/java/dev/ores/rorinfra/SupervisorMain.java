@@ -14,6 +14,9 @@ import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -100,7 +103,7 @@ public final class SupervisorMain {
       request.put("method", exchange.getRequestMethod());
       request.put("path", exchange.getRequestURI().getPath());
       request.put("query_string", exchange.getRequestURI().getRawQuery() == null ? "" : exchange.getRequestURI().getRawQuery());
-      request.put("body", new String(input, StandardCharsets.UTF_8));
+      request.put("body", decodeUtf8Strict(input));
       ObjectNode headers = request.putObject("headers");
       String contentType = exchange.getRequestHeaders().getFirst("content-type");
       if (contentType != null) headers.put("content-type", contentType);
@@ -109,6 +112,7 @@ public final class SupervisorMain {
 
       JsonNode result = cluster.invoke(request);
       int status = result.path("status").asInt(500);
+      if (status < 100 || status > 599) status = 500;
       result.path("headers").fields().forEachRemaining(header -> {
         String name = header.getKey().toLowerCase(Locale.ROOT);
         String value = header.getValue().isTextual() ? header.getValue().asText() : null;
@@ -119,6 +123,8 @@ public final class SupervisorMain {
       byte[] body = result.path("body").asText("").getBytes(StandardCharsets.UTF_8);
       exchange.sendResponseHeaders(status, body.length);
       exchange.getResponseBody().write(body);
+    } catch (CharacterCodingException error) {
+      sendError(exchange, 400, "request body must be valid UTF-8");
     } catch (RejectedExecutionException error) {
       sendError(exchange, 503, "Graal isolate saturated or retiring");
     } catch (TimeoutException error) {
@@ -924,7 +930,7 @@ public final class SupervisorMain {
         throw new IllegalArgumentException("relative HTTP path required");
       }
       String lower = path.toLowerCase(Locale.ROOT);
-      if (lower.contains("%2e") || lower.contains("%2f") || lower.contains("%5c")) {
+      if (lower.contains("%25") || lower.contains("%2e") || lower.contains("%2f") || lower.contains("%5c")) {
         throw new IllegalArgumentException("encoded path traversal is not allowed");
       }
       URI supplied = URI.create(path);
@@ -971,6 +977,14 @@ public final class SupervisorMain {
       if (uri.getPort() >= 0) return uri.getPort();
       return "https".equalsIgnoreCase(uri.getScheme()) ? 443 : 80;
     }
+  }
+
+  static String decodeUtf8Strict(byte[] bytes) throws CharacterCodingException {
+    return StandardCharsets.UTF_8.newDecoder()
+      .onMalformedInput(CodingErrorAction.REPORT)
+      .onUnmappableCharacter(CodingErrorAction.REPORT)
+      .decode(ByteBuffer.wrap(bytes))
+      .toString();
   }
 
   static boolean isLoopbackHost(String host) {
