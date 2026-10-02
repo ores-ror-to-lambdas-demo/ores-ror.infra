@@ -561,10 +561,11 @@ public final class SupervisorMain {
       this.settings = settings;
       this.context = newContext(engine);
       try {
-        context.getBindings("ruby").putMember("ores_gs_http", (ProxyExecutable) http::call);
         context.eval(commonSource);
-        this.invoke = context.eval(unitSource);
-        if (!invoke.canExecute()) throw new IllegalStateException("Graal isolate unit did not return an executable invoker: " + unit.key);
+        Value factory = context.eval(unitSource);
+        if (!factory.canExecute()) throw new IllegalStateException("Graal isolate unit did not return an executable factory: " + unit.key);
+        this.invoke = factory.execute((ProxyExecutable) http::call);
+        if (!invoke.canExecute()) throw new IllegalStateException("Graal isolate unit factory did not return an executable invoker: " + unit.key);
       } catch (Throwable error) {
         context.close(true);
         throw error;
@@ -595,6 +596,7 @@ public final class SupervisorMain {
         .allowEnvironmentAccess(EnvironmentAccess.NONE)
         .allowIO(io)
         .allowPolyglotAccess(PolyglotAccess.NONE)
+        .option("ruby.cexts", "false")
         .build();
     }
 
