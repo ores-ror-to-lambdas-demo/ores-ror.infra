@@ -35,6 +35,7 @@ jobs:
           test -f infra/aws-lambda/bootstrap
           test ! -e app/graal
           test ! -e app/aws-lambda
+          grep -qx '.bundle' app/.dockerignore
 
       - name: Generate Rails-free Graal units using infra-owned bootstrap
         working-directory: app
