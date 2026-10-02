@@ -254,11 +254,18 @@ public final class SupervisorMain {
     final String defaultStrategy;
     final String startup;
     final Map<String, String> routeAssignments;
+    final Map<String, String> routeIdentityAssignments;
 
-    WorkerPlacement(String defaultStrategy, String startup, Map<String, String> routeAssignments) {
+    WorkerPlacement(
+      String defaultStrategy,
+      String startup,
+      Map<String, String> routeAssignments,
+      Map<String, String> routeIdentityAssignments
+    ) {
       this.defaultStrategy = defaultStrategy;
       this.startup = startup;
       this.routeAssignments = Map.copyOf(routeAssignments);
+      this.routeIdentityAssignments = Map.copyOf(routeIdentityAssignments);
       if (!List.of("route", "group").contains(defaultStrategy)) {
         throw new IllegalArgumentException("worker placement default_strategy must be route or group");
       }
@@ -272,17 +279,19 @@ public final class SupervisorMain {
       if (configured.isEmpty()) {
         String legacy = env("GRAAL_WORKER_PLACEMENT", env("ISOLATION_GRANULARITY", "route")).toLowerCase(Locale.ROOT);
         String startup = env("GRAAL_WORKER_STARTUP", "lazy").toLowerCase(Locale.ROOT);
-        return new WorkerPlacement(legacy, startup, Map.of());
+        return new WorkerPlacement(legacy, startup, Map.of(), Map.of());
       }
 
       Path path = Path.of(configured);
       if (!path.isAbsolute()) path = appRoot.resolve(path);
       path = path.toAbsolutePath().normalize();
       try {
-        Path realAppRoot = appRoot.toRealPath();
+        if (Files.isSymbolicLink(path)) {
+          throw new IllegalArgumentException("GRAAL_WORKER_PLACEMENT_FILE may not be a symlink");
+        }
         Path real = path.toRealPath();
-        if (!real.startsWith(realAppRoot)) {
-          throw new IllegalArgumentException("GRAAL_WORKER_PLACEMENT_FILE must remain inside APP_ROOT");
+        if (!Files.isRegularFile(real)) {
+          throw new IllegalArgumentException("GRAAL_WORKER_PLACEMENT_FILE must be a regular file");
         }
         if (Files.size(real) > 256 * 1024) {
           throw new IllegalArgumentException("worker placement file exceeds 256 KiB");
@@ -293,27 +302,34 @@ public final class SupervisorMain {
         }
         String defaultStrategy = root.path("default_strategy").asText("route").toLowerCase(Locale.ROOT);
         String startup = root.path("startup").asText("lazy").toLowerCase(Locale.ROOT);
-        Map<String, String> assignments = new LinkedHashMap<>();
-        JsonNode configuredAssignments = root.path("route_assignments");
-        if (!configuredAssignments.isObject()) {
-          throw new IllegalArgumentException("worker placement route_assignments must be an object");
-        }
-        configuredAssignments.fields().forEachRemaining(entry -> {
-          String routeId = entry.getKey();
-          String unitKey = entry.getValue().asText();
-          if (routeId.isBlank() || routeId.length() > MAX_IDENTIFIER || unitKey.isBlank() || unitKey.length() > MAX_IDENTIFIER + 32) {
-            throw new IllegalArgumentException("worker placement contains an invalid route/unit key");
-          }
-          assignments.put(routeId, unitKey);
-        });
-        return new WorkerPlacement(defaultStrategy, startup, assignments);
+        Map<String, String> assignments = parseAssignmentObject(root.path("route_assignments"), "route_assignments", MAX_IDENTIFIER);
+        Map<String, String> identities = parseAssignmentObject(root.path("route_identity_assignments"), "route_identity_assignments", MAX_ROUTE_PATH + 16);
+        return new WorkerPlacement(defaultStrategy, startup, assignments, identities);
       } catch (IOException error) {
         throw new IllegalArgumentException("cannot read GRAAL_WORKER_PLACEMENT_FILE: " + path, error);
       }
     }
 
+    static Map<String, String> parseAssignmentObject(JsonNode node, String label, int maxSelectorLength) {
+      if (node.isMissingNode() || node.isNull()) return Map.of();
+      if (!node.isObject()) throw new IllegalArgumentException("worker placement " + label + " must be an object");
+      Map<String, String> parsed = new LinkedHashMap<>();
+      node.fields().forEachRemaining(entry -> {
+        String selector = entry.getKey();
+        String unitKey = entry.getValue().asText();
+        if (selector.isBlank() || selector.length() > maxSelectorLength
+            || unitKey.isBlank() || unitKey.length() > MAX_IDENTIFIER + 32) {
+          throw new IllegalArgumentException("worker placement contains an invalid selector/unit key");
+        }
+        parsed.put(selector, unitKey);
+      });
+      return parsed;
+    }
+
     String unitKey(RouteDef route) {
       String assigned = routeAssignments.get(route.routeId);
+      if (assigned != null) return assigned;
+      assigned = routeIdentityAssignments.get(route.verb + " " + route.path);
       if (assigned != null) return assigned;
       return "group".equals(defaultStrategy) ? "group:" + route.group : "route:" + route.routeId;
     }
@@ -439,7 +455,7 @@ public final class SupervisorMain {
         0,
         root,
         root.resolve("generated/graal/manifest.json"),
-        new WorkerPlacement(granularity, "lazy", Map.of()),
+        new WorkerPlacement(granularity, "lazy", Map.of(), Map.of()),
         "http://127.0.0.1:9/v1",
         "",
         workers,
@@ -487,6 +503,13 @@ public final class SupervisorMain {
       for (String configuredRoute : placement.routeAssignments.keySet()) {
         if (!knownRoutes.contains(configuredRoute)) {
           throw new IllegalArgumentException("worker placement references unknown route_id " + configuredRoute);
+        }
+      }
+      Set<String> knownIdentities = new java.util.HashSet<>();
+      for (RouteDef route : routes) knownIdentities.add(route.verb + " " + route.path);
+      for (String configuredIdentity : placement.routeIdentityAssignments.keySet()) {
+        if (!knownIdentities.contains(configuredIdentity)) {
+          throw new IllegalArgumentException("worker placement references unknown route identity " + configuredIdentity);
         }
       }
       for (RouteDef route : routes) {
@@ -887,6 +910,18 @@ public final class SupervisorMain {
     }
   }
 
+  /**
+   * One long-lived TruffleRuby runtime/isolation cell.
+   *
+   * A GraalWorker is not inherently a Lambda handler and is not required to be
+   * 1:1 with a route. Worker placement is selected separately by Settings:
+   * the safe default is one worker per generated route unit, while compatible
+   * generated units may be shared by multiple routes.
+   *
+   * Future generated units such as domain:public, domain:private, and
+   * domain:admin can use the same placement mechanism without changing this
+   * lifecycle abstraction.
+   */
   static final class GraalWorker implements AutoCloseable {
     record RuntimeState(Context context, Value invoke) {}
 
