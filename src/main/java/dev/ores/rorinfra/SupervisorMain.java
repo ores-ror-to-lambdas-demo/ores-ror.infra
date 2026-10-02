@@ -625,7 +625,7 @@ public final class SupervisorMain {
         .allowHostAccess(HostAccess.EXPLICIT)
         .allowHostClassLookup(name -> false)
         .allowHostClassLoading(false)
-        .allowNativeAccess(true)
+        .allowNativeAccess(false)
         .allowCreateProcess(false)
         .allowCreateThread(false)
         .allowEnvironmentAccess(EnvironmentAccess.NONE)
