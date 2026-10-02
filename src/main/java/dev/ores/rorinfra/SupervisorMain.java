@@ -35,6 +35,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.regex.Pattern;
 import org.graalvm.polyglot.Context;
 import org.graalvm.polyglot.Engine;
@@ -416,7 +417,7 @@ public final class SupervisorMain {
     }
 
     static Source source(String code, String name) throws IOException {
-      return Source.newBuilder("ruby", code, name).interactive(true).cached(true).build();
+      return Source.newBuilder("ruby", code, name).cached(true).build();
     }
 
     JsonNode invoke(ObjectNode request) throws Exception {
@@ -551,6 +552,9 @@ public final class SupervisorMain {
     final AtomicLong last = new AtomicLong(born);
     final AtomicLong retiredAt = new AtomicLong(Long.MAX_VALUE);
     final AtomicInteger active = new AtomicInteger();
+    final AtomicInteger guestEntries = new AtomicInteger();
+    final AtomicInteger maxGuestEntries = new AtomicInteger();
+    final ReentrantLock contextEntry = new ReentrantLock(true);
     volatile boolean open = true;
     volatile boolean closed;
 
@@ -605,13 +609,21 @@ public final class SupervisorMain {
       CompletableFuture<JsonNode> future = new CompletableFuture<>();
       pool.execute(() -> {
         active.incrementAndGet();
+        contextEntry.lock();
         try {
-          Value value = invoke.execute(JSON.writeValueAsString(request));
-          JsonNode response = JSON.readTree(value.asString());
-          future.complete(withDiagnostics(response));
+          int entries = guestEntries.incrementAndGet();
+          maxGuestEntries.accumulateAndGet(entries, Math::max);
+          try {
+            Value value = invoke.execute(JSON.writeValueAsString(request));
+            JsonNode response = JSON.readTree(value.asString());
+            future.complete(withDiagnostics(response));
+          } finally {
+            guestEntries.decrementAndGet();
+          }
         } catch (Throwable error) {
           future.completeExceptionally(error);
         } finally {
+          contextEntry.unlock();
           active.decrementAndGet();
           last.set(System.currentTimeMillis());
         }
@@ -636,6 +648,10 @@ public final class SupervisorMain {
 
     int load() {
       return active.get() + pool.getQueue().size();
+    }
+
+    int maxConcurrentGuestEntries() {
+      return maxGuestEntries.get();
     }
 
     boolean accepting() {
