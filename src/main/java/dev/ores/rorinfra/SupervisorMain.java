@@ -31,6 +31,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -78,7 +79,7 @@ public final class SupervisorMain {
   public static void main(String[] args) throws Exception {
     Settings settings = Settings.fromEnv();
     try (Cluster cluster = new Cluster(settings)) {
-      int ingressThreads = Math.max(8, Math.min(64, settings.unitCount() * Math.min(settings.workersPerIsolate, 2)));
+      int ingressThreads = Math.max(8, Math.min(64, settings.unitCount() * Math.min(settings.isolateMaxConcurrency, 2)));
       ThreadPoolExecutor ingress = new ThreadPoolExecutor(
         ingressThreads,
         ingressThreads,
@@ -97,13 +98,14 @@ public final class SupervisorMain {
       }, "ror-shutdown"));
       server.start();
       System.out.printf(
-        "TruffleRuby/Graal listening on http://%s:%d worker-placement=%s startup=%s selected-workers=%d contexts/worker=1 admission-limit/context=%d shared-engine=1%n",
+        "TruffleRuby/Graal listening on http://%s:%d worker-placement=%s startup=%s selected-workers=%d contexts/worker=1 isolate-max-concurrency=%d graal-thread-pool=%d shared-engine=1%n",
         settings.bindHost,
         settings.port,
         settings.placement.defaultStrategy,
         settings.placement.startup,
         settings.unitCount(),
-        settings.workersPerIsolate);
+        settings.isolateMaxConcurrency,
+        settings.graalThreadPoolSize);
       Thread.currentThread().join();
     }
   }
@@ -347,7 +349,8 @@ public final class SupervisorMain {
     final WorkerPlacement placement;
     final String dataUrl;
     final String dataToken;
-    final int workersPerIsolate;
+    final int graalThreadPoolSize;
+    final int isolateMaxConcurrency;
     final long maxAgeMs;
     final long idleMs;
     final long drainMs;
@@ -366,7 +369,8 @@ public final class SupervisorMain {
       WorkerPlacement placement,
       String dataUrl,
       String dataToken,
-      int workersPerIsolate,
+      int graalThreadPoolSize,
+      int isolateMaxConcurrency,
       long maxAgeMs,
       long idleMs,
       long drainMs,
@@ -380,7 +384,8 @@ public final class SupervisorMain {
       this.placement = placement;
       this.dataUrl = dataUrl;
       this.dataToken = dataToken;
-      this.workersPerIsolate = workersPerIsolate;
+      this.graalThreadPoolSize = graalThreadPoolSize;
+      this.isolateMaxConcurrency = isolateMaxConcurrency;
       this.maxAgeMs = maxAgeMs;
       this.idleMs = idleMs;
       this.drainMs = drainMs;
@@ -441,7 +446,8 @@ public final class SupervisorMain {
         WorkerPlacement.fromEnv(appRoot),
         env("DATA_API_URL", "http://127.0.0.1:8787/v1"),
         env("DATA_API_TOKEN", ""),
-        integerAliases("CONTEXT_THREAD_POOL_SIZE", List.of("CONTEXT_ADMISSION_LIMIT", "CONTEXT_MAX_CONCURRENCY", "ISOLATE_MAX_CONCURRENCY"), 5, 1, 5),
+        integer("GRAAL_THREAD_POOL_SIZE", 32, 1, 256),
+        integerAliases("ISOLATE_MAX_CONCURRENCY", List.of("CONTEXT_THREAD_POOL_SIZE", "CONTEXT_ADMISSION_LIMIT", "CONTEXT_MAX_CONCURRENCY"), 5, 1, 5),
         1000L * integerAlias("CONTEXT_MAX_AGE_SECONDS", "ISOLATE_MAX_AGE_SECONDS", 1800, 60, 1800),
         1000L * integerAlias("CONTEXT_IDLE_SECONDS", "ISOLATE_IDLE_SECONDS", 300, 30, 300),
         1000L * integerAlias("CONTEXT_DRAIN_SECONDS", "ISOLATE_DRAIN_SECONDS", 30, 1, 300),
@@ -449,11 +455,15 @@ public final class SupervisorMain {
         bool("EXPOSE_GRAAL_DIAGNOSTICS", false));
     }
 
-    static Settings test(Path appRoot, String granularity, int workers) {
-      return test(appRoot, new WorkerPlacement(granularity, "lazy", Map.of(), Map.of()), workers);
+    static Settings test(Path appRoot, String granularity, int isolateMaxConcurrency) {
+      return test(appRoot, new WorkerPlacement(granularity, "lazy", Map.of(), Map.of()), isolateMaxConcurrency, 8);
     }
 
-    static Settings test(Path appRoot, WorkerPlacement placement, int workers) {
+    static Settings test(Path appRoot, WorkerPlacement placement, int isolateMaxConcurrency) {
+      return test(appRoot, placement, isolateMaxConcurrency, 8);
+    }
+
+    static Settings test(Path appRoot, WorkerPlacement placement, int isolateMaxConcurrency, int graalThreadPoolSize) {
       Path root = appRoot.toAbsolutePath().normalize();
       return new Settings(
         "127.0.0.1",
@@ -463,7 +473,8 @@ public final class SupervisorMain {
         placement,
         "http://127.0.0.1:9/v1",
         "",
-        workers,
+        graalThreadPoolSize,
+        isolateMaxConcurrency,
         1_800_000,
         300_000,
         5_000,
@@ -530,7 +541,7 @@ public final class SupervisorMain {
     }
 
     void validateManifest(JsonNode manifest) {
-      if (!"ores-graal-ruby-manifest/v4".equals(manifest.path("schema").asText())) {
+      if (!"ores-graal-ruby-manifest/v5".equals(manifest.path("schema").asText())) {
         throw new IllegalArgumentException("unsupported Graal manifest schema");
       }
       if (!"ores-ror.rb".equals(manifest.path("application").asText())
@@ -547,17 +558,19 @@ public final class SupervisorMain {
       if (manifest.path("contexts_per_isolate").asInt(0) != 1) {
         throw new IllegalArgumentException("Graal manifest must declare exactly one Context per isolate");
       }
-      if (manifest.path("host_thread_pool_size_per_context").asInt(0) != 5
-          || manifest.path("guest_owner_threads_per_context").asInt(0) != 5
-          || manifest.path("execution_concurrency_per_context").asInt(0) != 5) {
-        throw new IllegalArgumentException("each Graal Context must declare a five-thread host executor");
+      if (!"process-shared".equals(manifest.path("host_thread_pool_scope").asText())
+          || !"infra-runtime-config".equals(manifest.path("host_thread_pool_size_source").asText())
+          || !manifest.path("host_threads_reused_across_isolates").asBoolean(false)
+          || !"none".equals(manifest.path("host_thread_affinity").asText())) {
+        throw new IllegalArgumentException("Graal manifest must declare reusable process-wide host threads");
       }
+      int executionLimit = manifest.path("max_execution_concurrency_per_isolate").asInt(0);
       int admissionLimit = manifest.path("max_admitted_in_flight_per_isolate").asInt(0);
-      if (admissionLimit < 1 || admissionLimit > 5) {
-        throw new IllegalArgumentException("manifest admission limit must be between 1 and 5");
+      if (executionLimit < 1 || executionLimit > 5 || admissionLimit < 1 || admissionLimit > 5) {
+        throw new IllegalArgumentException("manifest isolate concurrency limits must be between 1 and 5");
       }
-      if (workersPerIsolate > admissionLimit) {
-        throw new IllegalArgumentException("configured admission limit exceeds generated manifest limit");
+      if (isolateMaxConcurrency > executionLimit || isolateMaxConcurrency > admissionLimit) {
+        throw new IllegalArgumentException("configured isolate concurrency exceeds generated manifest limit");
       }
       if (!manifest.path("request_multiplexing").asBoolean(false)) {
         throw new IllegalArgumentException("Graal manifest must explicitly enable request multiplexing");
@@ -633,8 +646,9 @@ public final class SupervisorMain {
           throw new IllegalArgumentException("invalid or duplicate isolate unit: " + key);
         }
         if (unit.path("context_count").asInt(0) != 1
-            || unit.path("host_thread_pool_size").asInt(0) != 5
-            || unit.path("guest_owner_threads").asInt(0) != 5
+            || !"process-shared".equals(unit.path("host_thread_pool_scope").asText())
+            || !unit.path("host_threads_reused_across_isolates").asBoolean(false)
+            || !"none".equals(unit.path("host_thread_affinity").asText())
             || unit.path("execution_concurrency").asInt(0) != 5
             || unit.path("admission_limit").asInt(0) != 5
             || !unit.path("request_multiplexing").asBoolean(false)) {
@@ -769,6 +783,7 @@ public final class SupervisorMain {
     final Settings settings;
     final HttpBridge http;
     final Engine engine;
+    final ThreadPoolExecutor guestExecutor;
     final Source commonSource;
     final Map<String, Source> unitSources = new HashMap<>();
     final Map<String, GraalWorker> cells = new LinkedHashMap<>();
@@ -781,6 +796,14 @@ public final class SupervisorMain {
       this.settings = settings;
       this.http = new HttpBridge(settings.dataUrl, settings.dataToken);
       this.engine = Engine.newBuilder("ruby").build();
+      this.guestExecutor = new ThreadPoolExecutor(
+        settings.graalThreadPoolSize,
+        settings.graalThreadPoolSize,
+        0,
+        TimeUnit.MILLISECONDS,
+        new ArrayBlockingQueue<>(Math.max(64, Math.min(4096, settings.graalThreadPoolSize * 16))),
+        named("graal-guest"),
+        new ThreadPoolExecutor.AbortPolicy());
       this.commonSource = source(settings.commonSource, "generated/graal/common.rb");
       for (UnitDef unit : settings.units.values()) {
         unitSources.put(unit.key, source(unit.unitSource, unit.unitPath.getFileName().toString() + "-" + safeName(unit.key)));
@@ -843,7 +866,15 @@ public final class SupervisorMain {
     }
 
     synchronized int admissionCapacity() {
-      return cells.values().stream().mapToInt(cell -> cell.settings.workersPerIsolate).sum();
+      return cells.values().stream().mapToInt(cell -> cell.settings.isolateMaxConcurrency).sum();
+    }
+
+    int sharedThreadPoolSize() {
+      return settings.graalThreadPoolSize;
+    }
+
+    int largestSharedThreadPoolSize() {
+      return guestExecutor.getLargestPoolSize();
     }
 
     synchronized int unitCount() {
@@ -858,7 +889,7 @@ public final class SupervisorMain {
     GraalWorker create(UnitDef unit) throws Exception {
       Source unitSource = unitSources.get(unit.key);
       if (unitSource == null) throw new IllegalStateException("missing cached Source for " + unit.key);
-      return new GraalWorker("isolate-" + (++nextId), unit, settings, engine, commonSource, unitSource, http);
+      return new GraalWorker("isolate-" + (++nextId), unit, settings, engine, guestExecutor, commonSource, unitSource, http);
     }
 
     void hardReplace(GraalWorker cell, String reason) throws Exception {
@@ -922,6 +953,15 @@ public final class SupervisorMain {
       for (GraalWorker cell : draining) cell.closeAfterDrain();
       cells.clear();
       draining.clear();
+      guestExecutor.shutdown();
+      try {
+        if (!guestExecutor.awaitTermination(Math.max(1, settings.drainMs), TimeUnit.MILLISECONDS)) {
+          guestExecutor.shutdownNow();
+        }
+      } catch (InterruptedException error) {
+        Thread.currentThread().interrupt();
+        guestExecutor.shutdownNow();
+      }
       engine.close();
     }
   }
@@ -937,6 +977,9 @@ public final class SupervisorMain {
    * Future generated units such as domain:public, domain:private, and
    * domain:admin can use the same placement mechanism without changing this
    * lifecycle abstraction.
+   *
+   * Host threads are process-wide compute capacity owned by Cluster. This
+   * worker owns no thread pool and may be entered by any shared pool thread.
    */
   static final class GraalWorker implements AutoCloseable {
     record RuntimeState(Context context, Value invoke) {}
@@ -945,7 +988,7 @@ public final class SupervisorMain {
     final String contextId;
     final UnitDef unit;
     final Settings settings;
-    final ThreadPoolExecutor owner;
+    final ThreadPoolExecutor executionPool;
     final Semaphore admission;
     final Context context;
     final Value invoke;
@@ -963,6 +1006,7 @@ public final class SupervisorMain {
       UnitDef unit,
       Settings settings,
       Engine engine,
+      ThreadPoolExecutor executionPool,
       Source commonSource,
       Source unitSource,
       HttpBridge http
@@ -971,42 +1015,39 @@ public final class SupervisorMain {
       this.contextId = id + "-context";
       this.unit = unit;
       this.settings = settings;
-      this.admission = new Semaphore(settings.workersPerIsolate, true);
-      this.owner = new ThreadPoolExecutor(
-        settings.workersPerIsolate,
-        settings.workersPerIsolate,
-        0,
-        TimeUnit.MILLISECONDS,
-        new ArrayBlockingQueue<>(Math.max(8, settings.workersPerIsolate * 2)),
-        named(safeName(unit.key) + "-guest-worker"),
-        new ThreadPoolExecutor.AbortPolicy());
+      this.executionPool = executionPool;
+      this.admission = new Semaphore(settings.isolateMaxConcurrency, true);
 
       RuntimeState state;
-      try {
-        state = owner.submit(() -> {
-          Context created = newContext(engine);
-          try {
-            created.eval(commonSource);
-            Value factory = created.eval(unitSource);
-            if (!factory.canExecute()) {
-              throw new IllegalStateException("Graal isolate unit did not return an executable factory: " + unit.key);
-            }
-            Value bound = factory.execute((ProxyExecutable) http::call);
-            if (!bound.canExecute()) {
-              throw new IllegalStateException("Graal isolate unit factory did not return an executable invoker: " + unit.key);
-            }
-            return new RuntimeState(created, bound);
-          } catch (Throwable error) {
-            try {
-              created.close(true);
-            } catch (Throwable ignored) {
-              // initialization already failed
-            }
-            throw error;
+      var initialization = executionPool.submit(() -> {
+        Context created = newContext(engine);
+        try {
+          created.eval(commonSource);
+          Value factory = created.eval(unitSource);
+          if (!factory.canExecute()) {
+            throw new IllegalStateException("Graal isolate unit did not return an executable factory: " + unit.key);
           }
-        }).get();
+          Value bound = factory.execute((ProxyExecutable) http::call);
+          if (!bound.canExecute()) {
+            throw new IllegalStateException("Graal isolate unit factory did not return an executable invoker: " + unit.key);
+          }
+          return new RuntimeState(created, bound);
+        } catch (Throwable error) {
+          try {
+            created.close(true);
+          } catch (Throwable ignored) {
+            // initialization already failed
+          }
+          throw error;
+        }
+      });
+      try {
+        state = initialization.get(settings.requestTimeoutMs, TimeUnit.MILLISECONDS);
+      } catch (TimeoutException error) {
+        initialization.cancel(true);
+        throw new IllegalStateException("timed out initializing isolate " + unit.key, error);
       } catch (Throwable error) {
-        owner.shutdownNow();
+        initialization.cancel(true);
         throw error;
       }
       this.context = state.context();
@@ -1035,27 +1076,19 @@ public final class SupervisorMain {
         .build();
     }
 
-    CompletableFuture<JsonNode> submit(ObjectNode request) {
+    <T> CompletableFuture<T> submitGuestTask(Callable<T> task) {
       if (!accepting()) throw new RejectedExecutionException("isolate retiring");
       if (!admission.tryAcquire()) throw new RejectedExecutionException("isolate admission limit reached");
       last.set(System.currentTimeMillis());
       active.incrementAndGet();
 
-      CompletableFuture<JsonNode> future = new CompletableFuture<>();
+      CompletableFuture<T> future = new CompletableFuture<>();
       try {
-        owner.execute(() -> {
+        executionPool.execute(() -> {
           int entries = guestEntries.incrementAndGet();
           maxGuestEntries.accumulateAndGet(entries, Math::max);
           try {
-            Value value = invoke.execute(JSON.writeValueAsString(request));
-            String encoded = value.asString();
-            if (encoded.length() > MAX_GUEST_RESPONSE
-                || encoded.getBytes(StandardCharsets.UTF_8).length > MAX_GUEST_RESPONSE) {
-              throw new IllegalStateException("guest response exceeds size limit");
-            }
-            JsonNode response = JSON.readTree(encoded);
-            validateGuestResponse(response);
-            future.complete(withDiagnostics(response));
+            future.complete(task.call());
           } catch (Throwable error) {
             future.completeExceptionally(error);
           } finally {
@@ -1073,8 +1106,33 @@ public final class SupervisorMain {
       return future;
     }
 
+    CompletableFuture<JsonNode> submit(ObjectNode request) {
+      return submitGuestTask(() -> {
+        Value value = invoke.execute(JSON.writeValueAsString(request));
+        String encoded = value.asString();
+        if (encoded.length() > MAX_GUEST_RESPONSE
+            || encoded.getBytes(StandardCharsets.UTF_8).length > MAX_GUEST_RESPONSE) {
+          throw new IllegalStateException("guest response exceeds size limit");
+        }
+        JsonNode response = JSON.readTree(encoded);
+        validateGuestResponse(response);
+        return withDiagnostics(response);
+      });
+    }
+
+    CompletableFuture<String> evalForTestAsync(String ruby) {
+      return submitGuestTask(() -> context.eval("ruby", ruby).asString());
+    }
+
     String evalForTest(String ruby) throws Exception {
-      return owner.submit(() -> context.eval("ruby", ruby).asString()).get();
+      return evalForTestAsync(ruby).get();
+    }
+
+    String hostThreadNameForTest() throws Exception {
+      return submitGuestTask(() -> {
+        context.eval("ruby", "1");
+        return Thread.currentThread().getName();
+      }).get();
     }
 
     static void validateGuestResponse(JsonNode response) {
@@ -1134,7 +1192,6 @@ public final class SupervisorMain {
     synchronized void hardCancel(String reason) {
       if (closed) return;
       open = false;
-      owner.shutdownNow();
       try {
         context.close(true);
       } catch (Throwable error) {
@@ -1167,15 +1224,23 @@ public final class SupervisorMain {
       if (closed) return;
       open = false;
       if (load() != 0) throw new IllegalStateException("isolate busy: " + unit.key);
+      var closing = executionPool.submit(() -> {
+        context.close();
+        return null;
+      });
       try {
-        owner.submit(() -> {
-          context.close();
-          return null;
-        }).get();
+        closing.get(Math.max(1, settings.drainMs), TimeUnit.MILLISECONDS);
+      } catch (TimeoutException error) {
+        closing.cancel(true);
+        try {
+          context.close(true);
+        } catch (Throwable ignored) {
+          // preserve the lifecycle timeout as the primary failure
+        }
+        throw new IllegalStateException("timed out closing isolate " + unit.key, error);
       } catch (Exception error) {
+        closing.cancel(true);
         throw new IllegalStateException("failed to close isolate " + unit.key, error);
-      } finally {
-        owner.shutdown();
       }
       closed = true;
     }
