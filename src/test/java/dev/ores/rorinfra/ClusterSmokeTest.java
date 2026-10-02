@@ -184,7 +184,8 @@ final class ClusterSmokeTest {
     assertThrows(IllegalArgumentException.class, () -> settings.validateManifest(wrongApplication));
 
     ObjectNode wrongSharedSource = manifest.deepCopy();
-    wrongSharedSource.withArray("isolate_units").get(0).withArray("sources").set(
+    ObjectNode firstUnit = (ObjectNode) wrongSharedSource.withArray("isolate_units").get(0);
+    firstUnit.withArray("sources").set(
       0, SupervisorMain.JSON.getNodeFactory().textNode("generated/graal/not-common.rb"));
     assertThrows(IllegalArgumentException.class, () -> settings.parseUnits(wrongSharedSource, "route"));
 
