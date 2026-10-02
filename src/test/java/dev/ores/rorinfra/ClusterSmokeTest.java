@@ -46,8 +46,9 @@ final class ClusterSmokeTest {
           JsonNode response = call.get();
           assertEquals(200, response.path("status").asInt(), response.toString());
           JsonNode body = SupervisorMain.JSON.readTree(response.path("body").asText());
-          assertEquals("truffleruby-graal", body.path("runtime").asText());
-          assertEquals("graal", body.path("execution_mode").asText());
+          assertTrue(body.path("ok").asBoolean(), body.toString());
+          assertEquals("ores-ror.rb", body.path("service").asText());
+          assertEquals("gha-" + n, body.path("request_id").asText());
           contextIds.add(response.path("headers").path("x-ores-graal-context-id").asText());
           workerThreads.add(response.path("headers").path("x-ores-graal-worker-thread").asText());
           assertTrue(response.path("headers").path("x-ores-graal-isolate-key").asText().startsWith("route:"));
@@ -57,7 +58,8 @@ final class ClusterSmokeTest {
         assertEquals(1, cluster.contextCount(), "one requested route should own one long-lived Context");
         assertEquals(1, cluster.workerCount());
         assertEquals(3, cluster.admissionCapacity());
-        var health = cluster.cells.get("route:GET /healthz");
+        var healthRoute = settings.resolveRoute("GET", "/healthz");
+        var health = cluster.cells.get(settings.unitKey(healthRoute));
         assertEquals(1, health.maxConcurrentGuestEntries(), "TruffleRuby Context entry must be serialized");
       } finally {
         clients.shutdownNow();
@@ -94,7 +96,8 @@ final class ClusterSmokeTest {
     try (var cluster = new SupervisorMain.Cluster(SupervisorMain.Settings.test(root, "route", 1))) {
       JsonNode health = cluster.invoke(request("capabilities", "GET", "/healthz"));
       assertEquals(200, health.path("status").asInt());
-      var worker = cluster.cells.get("route:GET /healthz");
+      var healthRoute = cluster.settings.resolveRoute("GET", "/healthz");
+      var worker = cluster.cells.get(cluster.settings.unitKey(healthRoute));
 
       String file = worker.evalForTest("begin; File.read('/etc/passwd'); 'allowed'; rescue Exception => e; e.class.name; end"
       );
