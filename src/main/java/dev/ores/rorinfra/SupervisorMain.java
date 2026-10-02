@@ -340,6 +340,9 @@ public final class SupervisorMain {
     }
 
     void validateManifest(JsonNode manifest) {
+      if (!"ores-graal-ruby-manifest/v4".equals(manifest.path("schema").asText())) {
+        throw new IllegalArgumentException("unsupported Graal manifest schema");
+      }
       if (manifest.path("rails_boot").asBoolean(true) || manifest.path("rails_application_initialized").asBoolean(true)) {
         throw new IllegalArgumentException("Graal manifest must be Rails-free");
       }
@@ -349,9 +352,16 @@ public final class SupervisorMain {
       if (manifest.path("contexts_per_isolate").asInt(0) != 1) {
         throw new IllegalArgumentException("Graal manifest must declare exactly one Context per isolate");
       }
-      int admissionLimit = manifest.path("max_concurrency_per_isolate").asInt(0);
+      if (manifest.path("guest_owner_threads_per_context").asInt(0) != 1
+          || manifest.path("execution_concurrency_per_context").asInt(0) != 1) {
+        throw new IllegalArgumentException("each Graal Context must have exactly one guest-owner thread and one executing request");
+      }
+      int admissionLimit = manifest.path("max_admitted_in_flight_per_isolate").asInt(0);
       if (admissionLimit < 1 || admissionLimit > 5) {
         throw new IllegalArgumentException("manifest admission limit must be between 1 and 5");
+      }
+      if (workersPerIsolate > admissionLimit) {
+        throw new IllegalArgumentException("configured admission limit exceeds generated manifest limit");
       }
       if (!manifest.path("request_multiplexing").asBoolean(false)) {
         throw new IllegalArgumentException("Graal manifest must explicitly enable request multiplexing");
@@ -397,6 +407,14 @@ public final class SupervisorMain {
         }
         if (key.isBlank() || group.isBlank() || ids.isEmpty() || parsed.containsKey(key)) {
           throw new IllegalArgumentException("invalid or duplicate isolate unit: " + key);
+        }
+        if (unit.path("context_count").asInt(0) != 1
+            || unit.path("guest_owner_threads").asInt(0) != 1
+            || unit.path("execution_concurrency").asInt(0) != 1
+            || unit.path("admission_limit").asInt(0) < 1
+            || unit.path("admission_limit").asInt(0) > 5
+            || !unit.path("request_multiplexing").asBoolean(false)) {
+          throw new IllegalArgumentException("invalid isolate execution contract: " + key);
         }
         Path unitPath = resolveArtifact(sources.get(1).asText());
         String source = readRubySource(unitPath, "Graal isolate unit " + key);
