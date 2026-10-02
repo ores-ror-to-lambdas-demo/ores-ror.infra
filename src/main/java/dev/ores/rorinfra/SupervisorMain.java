@@ -801,7 +801,7 @@ public final class SupervisorMain {
         settings.graalThreadPoolSize,
         0,
         TimeUnit.MILLISECONDS,
-        new ArrayBlockingQueue<>(Math.max(64, Math.min(4096, settings.graalThreadPoolSize * 16))),
+        new ArrayBlockingQueue<>(Math.max(64, Math.min(4096, settings.graalThreadPoolSize * 16)), true),
         named("graal-guest"),
         new ThreadPoolExecutor.AbortPolicy());
       this.commonSource = source(settings.commonSource, "generated/graal/common.rb");
@@ -1224,10 +1224,21 @@ public final class SupervisorMain {
       if (closed) return;
       open = false;
       if (load() != 0) throw new IllegalStateException("isolate busy: " + unit.key);
-      var closing = executionPool.submit(() -> {
-        context.close();
-        return null;
-      });
+      java.util.concurrent.Future<?> closing;
+      try {
+        closing = executionPool.submit(() -> {
+          context.close();
+          return null;
+        });
+      } catch (RejectedExecutionException rejected) {
+        try {
+          context.close(true);
+        } catch (Throwable error) {
+          rejected.addSuppressed(error);
+        }
+        closed = true;
+        return;
+      }
       try {
         closing.get(Math.max(1, settings.drainMs), TimeUnit.MILLISECONDS);
       } catch (TimeoutException error) {
@@ -1240,6 +1251,11 @@ public final class SupervisorMain {
         throw new IllegalStateException("timed out closing isolate " + unit.key, error);
       } catch (Exception error) {
         closing.cancel(true);
+        try {
+          context.close(true);
+        } catch (Throwable ignored) {
+          // preserve the executor/close failure as primary
+        }
         throw new IllegalStateException("failed to close isolate " + unit.key, error);
       }
       closed = true;
