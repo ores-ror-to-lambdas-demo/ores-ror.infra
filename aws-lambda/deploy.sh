@@ -39,7 +39,8 @@ aws ecr get-login-password --region "$AWS_REGION" \
 docker buildx build \
   --platform "$DOCKER_PLATFORM" \
   --provenance=false \
-  -f "$APP_ROOT/aws-lambda/Dockerfile" \
+  --build-context ores_infra="$ROOT" \
+  -f "$ROOT/aws-lambda/Dockerfile" \
   -t "${REPOSITORY_URI}:${IMAGE_TAG}" \
   --push \
   "$APP_ROOT"

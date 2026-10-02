@@ -1,32 +1,41 @@
 # ores-ror.infra
 
-In-process GraalVM/TruffleRuby supervisor for the Rails-to-lambdas demo.
+Deployment/runtime infrastructure for `ores-ror-to-lambdas-demo/ores-ror.rb`.
 
-The runtime intentionally has **no child processes, no guest IPC, no FFI, and no guest-created threads**. The host process owns fixed executors and Graal Engines. Each warm Ruby isolate shares one cached `Source` and a host HTTP client, while every invocation gets a fresh `Context` and explicit request envelope.
+## Repository boundary
 
-## Isolate lifecycle
+The application repository is the only authority for application semantics:
 
-- maximum concurrent requests per isolate: **5**
-- maximum isolate age: **30 minutes**
-- idle retirement: **5 minutes** with zero active requests
-- old isolates stop accepting new requests, drain in-flight requests, then close
-- replacement isolates are created before traffic is shifted when possible
-- a host pool thread is reusable across arbitrarily many requests; request state never lives in `ThreadLocal`/thread identity
+- `config/routes.rb` — route + per-route middleware authority;
+- `routes/**/handler.rb` — physical route adapters;
+- `app/controllers`, `app/models`, `app/views` — MVC source;
+- `lib/ores_app/**` — shared dispatcher/middleware/business runtime;
+- `lib/ores_build/**` and `bin/build-runtime` — Rails-free compiler;
+- `generated/**` — ephemeral route/group artifacts.
 
-## Graal Show compatibility
+This infra repository owns how those generated artifacts are hosted:
 
-The guest artifact follows `graal-show/gs-compiler` / `graal-show/gs-lambdas` conventions:
+- `graal/**` — Graal/TruffleRuby bootstrap and runtime profile;
+- `aws-lambda/**` — Lambda Docker/runtime adapter/deployment assets;
+- Java supervisor / deployment tooling.
 
-- language: `ruby`
-- ABI: `json-string-v1`
-- support API: `gs-support-v1`
-- `SandboxPolicy.UNTRUSTED`
-- spawned isolate Engine
-- no host class access, raw I/O, native access, process creation, environment access, or guest thread creation
-- capability-scoped HTTP only
+There must be no second route table or middleware list here.
 
-The runtime is intentionally in-process instead of the line-oriented stdin/stdout cell transport because this demo's isolation contract forbids runtime IPC/child processes.
+## Graal generation
 
-## HTTP database path
+With sibling checkouts:
 
-The Ruby handler never receives a database socket. It calls `gs_http` against the configured HTTP Data API prefix. The supervisor owns one Java `HttpClient` per warm isolate, allowing the JDK client to reuse pooled HTTP/1.1 or HTTP/2 connections.
+```sh
+cd ../ores-ror.rb
+ORES_INFRA_ROOT=../ores-ror.infra ORES_BUILD_TARGET=graal truffleruby bin/build-runtime
+```
+
+The compiler reads `ores-ror.infra/graal/bootstrap.rb` and appends it to each generated route/group unit. All controller/model/view/route/middleware source still comes from the app repo.
+
+## AWS Lambda
+
+The Dockerfile lives here but uses the app checkout as its primary build context and this repo as a named BuildKit context. See `aws-lambda/README.md`.
+
+## Invariant
+
+Moving hosting adapters here must not change routing or middleware behavior. Cross-repo CI checks all 15 application routes as JSON and HTML and preserves the exact Rails-vs-Graal contract diff.
