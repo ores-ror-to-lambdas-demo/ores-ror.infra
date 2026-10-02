@@ -258,13 +258,13 @@ final class ClusterSmokeTest {
 
     ObjectNode wrongUnitPool = manifest.deepCopy();
     ((ObjectNode) wrongUnitPool.withArray("isolate_units").get(0)).put("host_thread_pool_size", 4);
-    assertThrows(IllegalArgumentException.class, () -> settings.parseUnits(wrongUnitPool, "route"));
+    assertThrows(IllegalArgumentException.class, () -> settings.parseUnits(wrongUnitPool));
 
     ObjectNode wrongSharedSource = manifest.deepCopy();
     ObjectNode firstUnit = (ObjectNode) wrongSharedSource.withArray("isolate_units").get(0);
     firstUnit.withArray("sources").set(
       0, SupervisorMain.JSON.getNodeFactory().textNode("generated/graal/not-common.rb"));
-    assertThrows(IllegalArgumentException.class, () -> settings.parseUnits(wrongSharedSource, "route"));
+    assertThrows(IllegalArgumentException.class, () -> settings.parseUnits(wrongSharedSource));
 
     ObjectNode duplicateRouteId = manifest.deepCopy();
     String firstId = duplicateRouteId.withArray("routes").get(0).path("route_id").asText();
