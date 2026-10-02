@@ -9,6 +9,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.InetSocketAddress;
 import java.net.URI;
+import java.net.URISyntaxException;
 import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -21,7 +22,9 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
@@ -50,6 +53,12 @@ import org.graalvm.polyglot.proxy.ProxyExecutable;
 public final class SupervisorMain {
   static final ObjectMapper JSON = new ObjectMapper();
   static final int MAX_BODY = 1024 * 1024;
+  static final Set<String> HTTP_METHODS = Set.of("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS");
+  static final Set<String> HOP_BY_HOP_HEADERS = Set.of(
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailer", "transfer-encoding", "upgrade"
+  );
+  static final Pattern HEADER_NAME = Pattern.compile("^[!#$%&'*+.^_`|~0-9A-Za-z-]+$");
 
   private SupervisorMain() {}
 
@@ -95,14 +104,16 @@ public final class SupervisorMain {
       ObjectNode headers = request.putObject("headers");
       String contentType = exchange.getRequestHeaders().getFirst("content-type");
       if (contentType != null) headers.put("content-type", contentType);
+      String accept = exchange.getRequestHeaders().getFirst("accept");
+      if (accept != null) headers.put("accept", accept);
 
       JsonNode result = cluster.invoke(request);
       int status = result.path("status").asInt(500);
       result.path("headers").fields().forEachRemaining(header -> {
-        if (header.getValue().isTextual()
-            && !header.getKey().equalsIgnoreCase("content-length")
-            && !header.getKey().equalsIgnoreCase("connection")) {
-          exchange.getResponseHeaders().set(header.getKey(), header.getValue().asText());
+        String name = header.getKey().toLowerCase(Locale.ROOT);
+        String value = header.getValue().isTextual() ? header.getValue().asText() : null;
+        if (safeResponseHeader(name, value)) {
+          exchange.getResponseHeaders().set(name, value);
         }
       });
       byte[] body = result.path("body").asText("").getBytes(StandardCharsets.UTF_8);
@@ -113,7 +124,8 @@ public final class SupervisorMain {
     } catch (TimeoutException error) {
       sendError(exchange, 504, "Graal request timed out; isolate replaced");
     } catch (Exception error) {
-      sendError(exchange, 500, safe(error));
+      System.err.println("Graal request failed: " + safe(error));
+      sendError(exchange, 500, "internal Graal execution failure");
     } finally {
       exchange.close();
     }
@@ -124,6 +136,17 @@ public final class SupervisorMain {
     exchange.getResponseHeaders().set("content-type", "application/json; charset=utf-8");
     exchange.sendResponseHeaders(status, body.length);
     exchange.getResponseBody().write(body);
+  }
+
+  static boolean safeResponseHeader(String name, String value) {
+    return name != null
+      && HEADER_NAME.matcher(name).matches()
+      && !"content-length".equals(name)
+      && !HOP_BY_HOP_HEADERS.contains(name)
+      && value != null
+      && value.indexOf('\r') < 0
+      && value.indexOf('\n') < 0
+      && value.length() <= 8192;
   }
 
   static final class RouteDef {
@@ -192,6 +215,8 @@ public final class SupervisorMain {
     final String commonSource;
     final List<RouteDef> routes;
     final Map<String, UnitDef> units;
+    final Path artifactRoot;
+    final boolean exposeDiagnostics;
 
     Settings(
       String bindHost,
@@ -205,7 +230,8 @@ public final class SupervisorMain {
       long maxAgeMs,
       long idleMs,
       long drainMs,
-      long requestTimeoutMs
+      long requestTimeoutMs,
+      boolean exposeDiagnostics
     ) {
       this.bindHost = bindHost;
       this.port = port;
@@ -219,16 +245,30 @@ public final class SupervisorMain {
       this.idleMs = idleMs;
       this.drainMs = drainMs;
       this.requestTimeoutMs = requestTimeoutMs;
+      this.exposeDiagnostics = exposeDiagnostics;
       if (!List.of("route", "group").contains(granularity)) {
         throw new IllegalArgumentException("ISOLATION_GRANULARITY must be route or group");
       }
       URI uri = URI.create(dataUrl);
-      if (!List.of("http", "https").contains(uri.getScheme())) {
-        throw new IllegalArgumentException("DATA_API_URL must use http or https");
+      if (!List.of("http", "https").contains(uri.getScheme())
+          || uri.getHost() == null
+          || uri.getUserInfo() != null
+          || uri.getRawQuery() != null
+          || uri.getRawFragment() != null) {
+        throw new IllegalArgumentException("DATA_API_URL must be an http(s) origin/base path without credentials, query, or fragment");
+      }
+      if (!dataToken.isEmpty() && "http".equalsIgnoreCase(uri.getScheme()) && !isLoopbackHost(uri.getHost())) {
+        throw new IllegalArgumentException("DATA_API_TOKEN requires HTTPS unless DATA_API_URL is loopback");
       }
 
       try {
-        JsonNode manifest = JSON.readTree(Files.readString(this.manifestPath, StandardCharsets.UTF_8));
+        Path realAppRoot = this.appRoot.toRealPath();
+        Path realManifest = this.manifestPath.toRealPath();
+        if (!realManifest.startsWith(realAppRoot)) {
+          throw new IllegalArgumentException("GRAAL_MANIFEST_PATH must remain inside APP_ROOT");
+        }
+        this.artifactRoot = realManifest.getParent();
+        JsonNode manifest = JSON.readTree(Files.readString(realManifest, StandardCharsets.UTF_8));
         validateManifest(manifest);
         Path commonPath = resolveArtifact(manifest.path("shared_source").asText());
         this.commonSource = readRubySource(commonPath, "shared Graal source");
@@ -256,7 +296,8 @@ public final class SupervisorMain {
         1000L * integerAlias("CONTEXT_MAX_AGE_SECONDS", "ISOLATE_MAX_AGE_SECONDS", 1800, 60, 1800),
         1000L * integerAlias("CONTEXT_IDLE_SECONDS", "ISOLATE_IDLE_SECONDS", 300, 30, 300),
         1000L * integerAlias("CONTEXT_DRAIN_SECONDS", "ISOLATE_DRAIN_SECONDS", 30, 1, 300),
-        1000L * integer("REQUEST_TIMEOUT_SECONDS", 15, 1, 300));
+        1000L * integer("REQUEST_TIMEOUT_SECONDS", 15, 1, 300),
+        bool("EXPOSE_GRAAL_DIAGNOSTICS", false));
     }
 
     static Settings test(Path appRoot, String granularity, int workers) {
@@ -273,7 +314,8 @@ public final class SupervisorMain {
         1_800_000,
         300_000,
         5_000,
-        120_000);
+        120_000,
+        true);
     }
 
     int unitCount() {
@@ -304,8 +346,15 @@ public final class SupervisorMain {
       if (!"one-long-lived-context-per-route-or-group-isolate".equals(manifest.path("context_model").asText())) {
         throw new IllegalArgumentException("unexpected Graal context model");
       }
-      if (manifest.path("max_concurrency_per_isolate").asInt(0) > 5) {
-        throw new IllegalArgumentException("manifest exceeds five threads per isolate");
+      if (manifest.path("contexts_per_isolate").asInt(0) != 1) {
+        throw new IllegalArgumentException("Graal manifest must declare exactly one Context per isolate");
+      }
+      int admissionLimit = manifest.path("max_concurrency_per_isolate").asInt(0);
+      if (admissionLimit < 1 || admissionLimit > 5) {
+        throw new IllegalArgumentException("manifest admission limit must be between 1 and 5");
+      }
+      if (!manifest.path("request_multiplexing").asBoolean(false)) {
+        throw new IllegalArgumentException("Graal manifest must explicitly enable request multiplexing");
       }
       if (!"process-shared".equals(manifest.path("engine_scope").asText())) {
         throw new IllegalArgumentException("Graal manifest must use a process-shared Engine");
@@ -314,12 +363,21 @@ public final class SupervisorMain {
 
     List<RouteDef> parseRoutes(JsonNode manifest) {
       List<RouteDef> parsed = new ArrayList<>();
+      Set<String> identities = new java.util.HashSet<>();
       for (JsonNode route : manifest.path("routes")) {
-        parsed.add(new RouteDef(
-          route.path("verb").asText(),
-          route.path("path").asText(),
-          route.path("route_id").asText(),
-          route.path("group").asText()));
+        String verb = route.path("verb").asText().toUpperCase(Locale.ROOT);
+        String path = route.path("path").asText();
+        String routeId = route.path("route_id").asText();
+        String group = route.path("group").asText();
+        if (!HTTP_METHODS.contains(verb) || !path.startsWith("/") || path.indexOf('\0') >= 0
+            || routeId.isBlank() || group.isBlank()) {
+          throw new IllegalArgumentException("invalid route entry in Graal manifest");
+        }
+        String identity = verb + " " + path;
+        if (!identities.add(identity)) {
+          throw new IllegalArgumentException("duplicate route in Graal manifest: " + identity);
+        }
+        parsed.add(new RouteDef(verb, path, routeId, group));
       }
       return List.copyOf(parsed);
     }
@@ -337,6 +395,9 @@ public final class SupervisorMain {
         if (!sources.isArray() || sources.size() != 2) {
           throw new IllegalArgumentException("isolate unit must contain common + unit source: " + key);
         }
+        if (key.isBlank() || group.isBlank() || ids.isEmpty() || parsed.containsKey(key)) {
+          throw new IllegalArgumentException("invalid or duplicate isolate unit: " + key);
+        }
         Path unitPath = resolveArtifact(sources.get(1).asText());
         String source = readRubySource(unitPath, "Graal isolate unit " + key);
         parsed.put(key, new UnitDef(kind, key, group, ids, unitPath, source));
@@ -347,8 +408,16 @@ public final class SupervisorMain {
     Path resolveArtifact(String manifestPath) {
       Path resolved = appRoot.resolve(manifestPath).normalize();
       if (!resolved.startsWith(appRoot)) throw new IllegalArgumentException("artifact escapes APP_ROOT: " + manifestPath);
-      if (!Files.isRegularFile(resolved)) throw new IllegalArgumentException("missing generated artifact: " + resolved);
-      return resolved;
+      try {
+        Path real = resolved.toRealPath();
+        if (!real.startsWith(artifactRoot)) {
+          throw new IllegalArgumentException("artifact escapes generated Graal root: " + manifestPath);
+        }
+        if (!Files.isRegularFile(real)) throw new IllegalArgumentException("missing generated artifact: " + real);
+        return real;
+      } catch (IOException error) {
+        throw new IllegalArgumentException("cannot resolve generated artifact: " + resolved, error);
+      }
     }
 
     static String readRubySource(Path path, String label) {
@@ -379,6 +448,11 @@ public final class SupervisorMain {
       int parsed = Integer.parseInt(value);
       if (parsed < min || parsed > max) throw new IllegalArgumentException(preferred + " out of range");
       return parsed;
+    }
+
+    static boolean bool(String name, boolean defaultValue) {
+      String value = System.getenv(name);
+      return value == null || value.isBlank() ? defaultValue : Boolean.parseBoolean(value);
     }
 
     static String env(String name, String defaultValue) {
@@ -479,9 +553,10 @@ public final class SupervisorMain {
 
     void hardReplace(GraalWorker cell, String reason) throws Exception {
       if (closed || cells.get(cell.unit.key) != cell) return;
+      cells.remove(cell.unit.key);
+      cell.hardCancel(reason);
       GraalWorker replacement = create(cell.unit);
       cells.put(cell.unit.key, replacement);
-      cell.hardCancel(reason);
     }
 
     void gracefulReplace(GraalWorker cell, String reason) throws Exception {
@@ -621,6 +696,8 @@ public final class SupervisorMain {
       return Context.newBuilder("ruby")
         .engine(engine)
         .allowExperimentalOptions(true)
+        .option("ruby.platform-native", "false")
+        .option("ruby.cexts", "false")
         .allowAllAccess(false)
         .allowHostAccess(HostAccess.EXPLICIT)
         .allowHostClassLookup(name -> false)
@@ -671,7 +748,7 @@ public final class SupervisorMain {
     }
 
     JsonNode withDiagnostics(JsonNode response) {
-      if (!(response instanceof ObjectNode object)) return response;
+      if (!settings.exposeDiagnostics || !(response instanceof ObjectNode object)) return response;
       JsonNode existing = object.get("headers");
       ObjectNode headers;
       if (existing instanceof ObjectNode existingObject) headers = existingObject;
@@ -771,7 +848,7 @@ public final class SupervisorMain {
     final HttpClient client;
 
     HttpBridge(String url, String token) {
-      this.base = URI.create(url.replaceAll("/$", "") + "/");
+      this.base = URI.create(url.replaceAll("/+$", "") + "/");
       this.token = token;
       this.client = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(2))
@@ -782,12 +859,10 @@ public final class SupervisorMain {
     Object call(Value... args) {
       try {
         JsonNode request = JSON.readTree(args[0].asString());
-        String method = request.path("method").asText("GET").toUpperCase();
+        String method = request.path("method").asText("GET").toUpperCase(Locale.ROOT);
         String path = request.path("path").asText();
-        if (!path.startsWith("/") || path.contains("://")) throw new IllegalArgumentException("relative HTTP path required");
         String query = query(request.path("query"));
-        URI uri = URI.create(base.toString().replaceAll("/$", "") + path + (query.isEmpty() ? "" : "?" + query));
-        if (!sameOrigin(base, uri)) throw new IllegalArgumentException("HTTP origin escape");
+        URI uri = targetUri(base, method, path, query);
 
         JsonNode bodyNode = request.get("body");
         String body = bodyNode == null || bodyNode.isNull() ? "" : JSON.writeValueAsString(bodyNode);
@@ -807,19 +882,55 @@ public final class SupervisorMain {
         return JSON.writeValueAsString(
           JSON.createObjectNode().put("ok", true).put("status", response.statusCode()).put("body", new String(bytes, StandardCharsets.UTF_8)));
       } catch (Exception error) {
+        System.err.println("host HTTP bridge failure: " + safe(error));
         try {
-          return JSON.writeValueAsString(JSON.createObjectNode().put("ok", false).put("error", safe(error)));
+          return JSON.writeValueAsString(JSON.createObjectNode().put("ok", false).put("error", "host HTTP bridge request failed"));
         } catch (Exception ignored) {
-          return "{\"ok\":false,\"error\":\"bridge failure\"}";
+          return "{\"ok\":false,\"error\":\"host HTTP bridge request failed\"}";
         }
       }
+    }
+
+    static URI targetUri(URI base, String method, String path, String query) throws URISyntaxException {
+      if (!HTTP_METHODS.contains(method)) throw new IllegalArgumentException("unsupported HTTP method");
+      if (!path.startsWith("/") || path.contains("\\") || path.indexOf('\0') >= 0) {
+        throw new IllegalArgumentException("relative HTTP path required");
+      }
+      String lower = path.toLowerCase(Locale.ROOT);
+      if (lower.contains("%2e") || lower.contains("%2f") || lower.contains("%5c")) {
+        throw new IllegalArgumentException("encoded path traversal is not allowed");
+      }
+      URI supplied = URI.create(path);
+      if (supplied.isAbsolute() || supplied.getRawAuthority() != null
+          || supplied.getRawQuery() != null || supplied.getRawFragment() != null) {
+        throw new IllegalArgumentException("relative HTTP path required");
+      }
+
+      String basePath = base.getPath() == null ? "" : base.getPath().replaceAll("/+$", "");
+      URI target = new URI(
+        base.getScheme(), null, base.getHost(), base.getPort(),
+        basePath + path, query.isEmpty() ? null : query, null
+      ).normalize();
+      String allowedPrefix = basePath.isEmpty() ? "/" : basePath + "/";
+      if (!(target.getPath().equals(basePath) || target.getPath().startsWith(allowedPrefix))) {
+        throw new IllegalArgumentException("HTTP base path escape");
+      }
+      if (!sameOrigin(base, target)) throw new IllegalArgumentException("HTTP origin escape");
+      return target;
     }
 
     static String query(JsonNode query) {
       if (query == null || !query.isObject() || query.isEmpty()) return "";
       List<String> pairs = new ArrayList<>();
-      query.fields().forEachRemaining(entry -> pairs.add(
-        URLEncoder.encode(entry.getKey(), StandardCharsets.UTF_8) + "=" + URLEncoder.encode(entry.getValue().asText(), StandardCharsets.UTF_8)));
+      query.fields().forEachRemaining(entry -> {
+        String key = URLEncoder.encode(entry.getKey(), StandardCharsets.UTF_8);
+        JsonNode value = entry.getValue();
+        if (value.isArray()) {
+          value.forEach(item -> pairs.add(key + "=" + URLEncoder.encode(item.asText(), StandardCharsets.UTF_8)));
+        } else {
+          pairs.add(key + "=" + URLEncoder.encode(value.asText(), StandardCharsets.UTF_8));
+        }
+      });
       return String.join("&", pairs);
     }
 
@@ -833,6 +944,16 @@ public final class SupervisorMain {
       if (uri.getPort() >= 0) return uri.getPort();
       return "https".equalsIgnoreCase(uri.getScheme()) ? 443 : 80;
     }
+  }
+
+  static boolean isLoopbackHost(String host) {
+    if (host == null) return false;
+    String normalized = host.toLowerCase(Locale.ROOT);
+    return "localhost".equals(normalized)
+      || "127.0.0.1".equals(normalized)
+      || "::1".equals(normalized)
+      || "[::1]".equals(normalized)
+      || "0:0:0:0:0:0:0:1".equals(normalized);
   }
 
   static String requestId(String value) {
@@ -856,6 +977,8 @@ public final class SupervisorMain {
     Throwable current = error;
     while (current.getCause() != null && current.getCause() != current) current = current.getCause();
     String message = current.getMessage();
-    return current.getClass().getSimpleName() + (message == null ? "" : ": " + message);
+    String safeMessage = message == null ? "" : message.replaceAll("[\\r\\n\\t]+", " ");
+    if (safeMessage.length() > 512) safeMessage = safeMessage.substring(0, 512);
+    return current.getClass().getSimpleName() + (safeMessage.isEmpty() ? "" : ": " + safeMessage);
   }
 }
